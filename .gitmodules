@@ -1,6 +1,6 @@
 [submodule "packages/cs16-client/cs16-client"]
 	path = packages/cs16-client/cs16-client
-	url = https://github.com/yohimik/cs16-client.git
+	url = https://github.com/DaveS0x/cs16-client.git
 [submodule "packages/hlsdk-portable/hlsdk-portable"]
 	path = packages/hlsdk-portable/hlsdk-portable
 	url = https://github.com/yohimik/hlsdk-portable.git
