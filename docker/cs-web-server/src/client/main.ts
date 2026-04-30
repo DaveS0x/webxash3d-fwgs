@@ -446,7 +446,25 @@ function trySuspendAudioContext(source: string): boolean {
   return true
 }
 
+function releaseExclusiveBrowserModesOnHidden() {
+  if (!document.hidden) return
+
+  if (document.pointerLockElement && typeof document.exitPointerLock === 'function') {
+    try {
+      document.exitPointerLock()
+    } catch {
+      // Best-effort cleanup only; audio visibility handling should still continue.
+    }
+  }
+
+  if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+    void document.exitFullscreen().catch(() => undefined)
+  }
+}
+
 function handleAudioVisibilityChange() {
+  releaseExclusiveBrowserModesOnHidden()
+
   if (!audioBackendState.hiddenSuspendEnabled) {
     if (!document.hidden) tryResumeAudioContext('visibilitychange')
     return
