@@ -128,6 +128,7 @@ declare global {
     __CS_AUDIO_BACKEND__?: {
       snapshot: () => AudioBackendSnapshot
       resumeNow: () => boolean
+      suspendNow: () => boolean
     }
     __CS_STALL_LOGS?: StallLogBuffer
     __CS_CAMERA?: {
@@ -635,6 +636,7 @@ function installAudioContextHints() {
   window.__CS_AUDIO_BACKEND__ = {
     snapshot: audioContextSnapshot,
     resumeNow: () => tryResumeAudioContext('manual'),
+    suspendNow: () => trySuspendAudioContext('manual'),
   }
 
   for (const eventName of ['click', 'keydown', 'touchstart', 'mousedown', 'pointerdown']) {
@@ -651,9 +653,9 @@ function installAudioContextHints() {
     if (attempts >= 60 || context?.state === 'running') window.clearInterval(interval)
   }, 500)
 
-  // If neither hints nor bridge are active, still expose diagnostics and hidden-tab audio suspend.
-  if (!enabled && !workletBridgeEnabled) {
-    audioBackendState.installReason = hiddenSuspendEnabled ? 'hidden-suspend-only' : 'disabled'
+  // If nothing needs the AudioContext wrapper, still expose diagnostics and resume hooks.
+  if (!enabled && !workletBridgeEnabled && !hiddenSuspendEnabled) {
+    audioBackendState.installReason = 'disabled'
     return
   }
 
@@ -687,7 +689,7 @@ function installAudioContextHints() {
   window.AudioContext = WrappedAudioContext
   window.webkitAudioContext = WrappedAudioContext
   audioBackendState.installed = true
-  audioBackendState.installReason = 'installed'
+  audioBackendState.installReason = enabled || workletBridgeEnabled ? 'installed' : 'hidden-suspend-only'
 }
 
 installAudioContextHints()
