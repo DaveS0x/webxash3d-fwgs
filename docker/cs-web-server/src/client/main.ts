@@ -105,6 +105,19 @@ type StallLogBuffer = {
   setConsole: (enabled: boolean) => void
 }
 
+type ExclusiveModeGuardSnapshot = {
+  installed: boolean
+  browserFullscreenAllowed: boolean
+  fullscreenRequestAttempts: number
+  fullscreenForcedExits: number
+  lastFullscreenTarget?: string
+  lastFullscreenSource?: string
+}
+
+type FullscreenRequestElement = Element & {
+  webkitRequestFullscreen?: (keyboardInput?: unknown) => void
+}
+
 type XashModuleCallbacks = {
   nativeStallFrameBegin?: () => void
   nativeStallTrace?: (line: string) => void
@@ -126,6 +139,10 @@ declare global {
     __CS_AUDIO_CONTEXT_LATENCY_HINT?: AudioContextOptions['latencyHint'] | string
     __CS_AUDIO_WORKLET_BRIDGE?: boolean | string | number
     __CS_AUDIO_HIDDEN_SUSPEND?: boolean | string | number
+    __CS_ALLOW_BROWSER_FULLSCREEN?: boolean | string | number
+    __CS_EXCLUSIVE_MODE_GUARD__?: {
+      snapshot: () => ExclusiveModeGuardSnapshot
+    }
     __CS_AUDIO_BACKEND__?: {
       snapshot: () => AudioBackendSnapshot
       resumeNow: () => boolean
@@ -204,6 +221,12 @@ let audioSuspendedForHiddenTab = false
 let audioSuspendedForPageExitPrompt = false
 let pointerLockWasActive = false
 let pointerLockRecentlyReleased = false
+const exclusiveModeGuardState: ExclusiveModeGuardSnapshot = {
+  installed: false,
+  browserFullscreenAllowed: false,
+  fullscreenRequestAttempts: 0,
+  fullscreenForcedExits: 0,
+}
 
 // ---------------------------------------------------------------------------
 // Ring buffer state (set up once the worklet module loads)
@@ -531,6 +554,70 @@ function releaseExclusiveBrowserModes(source: string, exitFullscreen: boolean) {
   }
 }
 
+function describeFullscreenTarget(target: Element): string {
+  const id = target.id ? `#${target.id}` : ''
+  const className = typeof target.className === 'string' && target.className
+    ? `.${target.className.trim().replace(/\s+/g, '.')}`
+    : ''
+  return `${target.tagName.toLowerCase()}${id}${className}`
+}
+
+function noteBlockedFullscreenRequest(source: string, target: Element) {
+  exclusiveModeGuardState.fullscreenRequestAttempts++
+  exclusiveModeGuardState.lastFullscreenSource = source
+  exclusiveModeGuardState.lastFullscreenTarget = describeFullscreenTarget(target)
+  window.setTimeout(() => releaseExclusiveBrowserModes('fullscreen-guard', true), 0)
+}
+
+function forceExitBrowserFullscreen(source: string) {
+  if (!document.fullscreenElement) return
+  exclusiveModeGuardState.fullscreenForcedExits++
+  releaseExclusiveBrowserModes(source, true)
+}
+
+function installBrowserFullscreenGuard() {
+  if (exclusiveModeGuardState.installed) return
+  exclusiveModeGuardState.installed = true
+  exclusiveModeGuardState.browserFullscreenAllowed = readBooleanSetting(
+    '__CS_ALLOW_BROWSER_FULLSCREEN',
+    ['allow_browser_fullscreen', 'cs_allow_browser_fullscreen'],
+    buildEnv.VITE_CS_ALLOW_BROWSER_FULLSCREEN,
+    false,
+  )
+
+  window.__CS_EXCLUSIVE_MODE_GUARD__ = {
+    snapshot: () => ({ ...exclusiveModeGuardState }),
+  }
+
+  if (exclusiveModeGuardState.browserFullscreenAllowed) return
+
+  const originalRequestFullscreen = Element.prototype.requestFullscreen
+  if (typeof originalRequestFullscreen === 'function') {
+    Object.defineProperty(Element.prototype, 'requestFullscreen', {
+      configurable: true,
+      writable: true,
+      value(this: Element) {
+        noteBlockedFullscreenRequest('requestFullscreen', this)
+        return Promise.resolve()
+      },
+    })
+  }
+
+  const webkitElementPrototype = Element.prototype as FullscreenRequestElement
+  if (typeof webkitElementPrototype.webkitRequestFullscreen === 'function') {
+    Object.defineProperty(webkitElementPrototype, 'webkitRequestFullscreen', {
+      configurable: true,
+      writable: true,
+      value(this: Element) {
+        noteBlockedFullscreenRequest('webkitRequestFullscreen', this)
+      },
+    })
+  }
+
+  document.addEventListener('fullscreenchange', () => forceExitBrowserFullscreen('fullscreenchange'))
+  document.addEventListener('webkitfullscreenchange', () => forceExitBrowserFullscreen('webkitfullscreenchange'))
+}
+
 function releaseExclusiveBrowserModesOnHidden() {
   if (!document.hidden) return
   releaseExclusiveBrowserModes('visibility-hidden', true)
@@ -815,6 +902,7 @@ function installAudioContextHints() {
 }
 
 installAudioContextHints()
+installBrowserFullscreenGuard()
 
 // ---------------------------------------------------------------------------
 // Runtime globals and launch logic
