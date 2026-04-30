@@ -105,17 +105,23 @@ type StallLogBuffer = {
   setConsole: (enabled: boolean) => void
 }
 
-type ExclusiveModeGuardSnapshot = {
+type PointerLockGuardSnapshot = {
   installed: boolean
-  browserFullscreenAllowed: boolean
-  fullscreenRequestAttempts: number
-  fullscreenForcedExits: number
-  lastFullscreenTarget?: string
-  lastFullscreenSource?: string
+  needsFreshCanvasGesture: boolean
+  requestAttempts: number
+  allowedRequests: number
+  blockedRequests: number
+  forcedExits: number
+  trustedCanvasGestures: number
+  lastRequestTarget?: string
+  lastRequestSource?: string
+  lastBlockReason?: string
+  lastTrustedCanvasGestureMs?: number
 }
 
-type FullscreenRequestElement = Element & {
-  webkitRequestFullscreen?: (keyboardInput?: unknown) => void
+type PointerLockRequestElement = Element & {
+  requestPointerLock?: (options?: PointerLockOptions) => Promise<void> | void
+  webkitRequestPointerLock?: () => void
 }
 
 type XashModuleCallbacks = {
@@ -139,9 +145,8 @@ declare global {
     __CS_AUDIO_CONTEXT_LATENCY_HINT?: AudioContextOptions['latencyHint'] | string
     __CS_AUDIO_WORKLET_BRIDGE?: boolean | string | number
     __CS_AUDIO_HIDDEN_SUSPEND?: boolean | string | number
-    __CS_ALLOW_BROWSER_FULLSCREEN?: boolean | string | number
-    __CS_EXCLUSIVE_MODE_GUARD__?: {
-      snapshot: () => ExclusiveModeGuardSnapshot
+    __CS_POINTER_LOCK_GUARD__?: {
+      snapshot: () => PointerLockGuardSnapshot
     }
     __CS_AUDIO_BACKEND__?: {
       snapshot: () => AudioBackendSnapshot
@@ -221,11 +226,19 @@ let audioSuspendedForHiddenTab = false
 let audioSuspendedForPageExitPrompt = false
 let pointerLockWasActive = false
 let pointerLockRecentlyReleased = false
-const exclusiveModeGuardState: ExclusiveModeGuardSnapshot = {
+let pointerLockNeedsFreshCanvasGesture = true
+let pointerLockTrustedCanvasGestureUntilMs = 0
+let pointerLockAllowedRequestUntilMs = 0
+const POINTER_LOCK_GESTURE_GRACE_MS = 1500
+const POINTER_LOCK_ALLOWED_REQUEST_GRACE_MS = 2000
+const pointerLockGuardState: PointerLockGuardSnapshot = {
   installed: false,
-  browserFullscreenAllowed: false,
-  fullscreenRequestAttempts: 0,
-  fullscreenForcedExits: 0,
+  needsFreshCanvasGesture: true,
+  requestAttempts: 0,
+  allowedRequests: 0,
+  blockedRequests: 0,
+  forcedExits: 0,
+  trustedCanvasGestures: 0,
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +545,10 @@ function releaseKeyboardLock() {
   }
 }
 
+function getGameCanvas(): HTMLCanvasElement | null {
+  return document.getElementById('canvas') as HTMLCanvasElement | null
+}
+
 function releaseExclusiveBrowserModes(source: string, exitFullscreen: boolean) {
   void source
   if (document.pointerLockElement && typeof document.exitPointerLock === 'function') {
@@ -554,7 +571,7 @@ function releaseExclusiveBrowserModes(source: string, exitFullscreen: boolean) {
   }
 }
 
-function describeFullscreenTarget(target: Element): string {
+function describeElementTarget(target: Element): string {
   const id = target.id ? `#${target.id}` : ''
   const className = typeof target.className === 'string' && target.className
     ? `.${target.className.trim().replace(/\s+/g, '.')}`
@@ -562,74 +579,152 @@ function describeFullscreenTarget(target: Element): string {
   return `${target.tagName.toLowerCase()}${id}${className}`
 }
 
-function noteBlockedFullscreenRequest(source: string, target: Element) {
-  exclusiveModeGuardState.fullscreenRequestAttempts++
-  exclusiveModeGuardState.lastFullscreenSource = source
-  exclusiveModeGuardState.lastFullscreenTarget = describeFullscreenTarget(target)
-  window.setTimeout(() => releaseExclusiveBrowserModes('fullscreen-guard', true), 0)
+function isGameCanvasTarget(target: EventTarget | null): boolean {
+  const canvas = getGameCanvas()
+  return !!canvas && target === canvas
 }
 
-function forceExitBrowserFullscreen(source: string) {
-  if (!document.fullscreenElement) return
-  exclusiveModeGuardState.fullscreenForcedExits++
-  releaseExclusiveBrowserModes(source, true)
+function markPointerLockNeedsFreshGesture() {
+  pointerLockNeedsFreshCanvasGesture = true
+  pointerLockTrustedCanvasGestureUntilMs = 0
+  pointerLockAllowedRequestUntilMs = 0
+  pointerLockGuardState.needsFreshCanvasGesture = true
 }
 
-function installBrowserFullscreenGuard() {
-  if (exclusiveModeGuardState.installed) return
-  exclusiveModeGuardState.installed = true
-  exclusiveModeGuardState.browserFullscreenAllowed = readBooleanSetting(
-    '__CS_ALLOW_BROWSER_FULLSCREEN',
-    ['allow_browser_fullscreen', 'cs_allow_browser_fullscreen'],
-    buildEnv.VITE_CS_ALLOW_BROWSER_FULLSCREEN,
-    false,
-  )
+function noteTrustedCanvasGesture(event: Event) {
+  if (!event.isTrusted || !isGameCanvasTarget(event.target)) return
+  const now = performance.now()
+  pointerLockTrustedCanvasGestureUntilMs = now + POINTER_LOCK_GESTURE_GRACE_MS
+  pointerLockGuardState.trustedCanvasGestures++
+  pointerLockGuardState.lastTrustedCanvasGestureMs = now
+}
 
-  window.__CS_EXCLUSIVE_MODE_GUARD__ = {
-    snapshot: () => ({ ...exclusiveModeGuardState }),
+function hasRecentPointerLockUserGesture(): boolean {
+  const now = performance.now()
+  return now <= pointerLockTrustedCanvasGestureUntilMs || now <= pointerLockAllowedRequestUntilMs
+}
+
+function dispatchPointerLockError(target: Element) {
+  window.setTimeout(() => {
+    try {
+      document.dispatchEvent(new Event('pointerlockerror'))
+      target.dispatchEvent(new Event('pointerlockerror'))
+    } catch {
+      // Best-effort compatibility signal only.
+    }
+  }, 0)
+}
+
+function shouldAllowPointerLockRequest(target: Element): { allowed: boolean; reason?: string } {
+  if (document.hidden) return { allowed: false, reason: 'document-hidden' }
+  if (!isGameCanvasTarget(target)) return { allowed: false, reason: 'not-game-canvas' }
+  if (!pointerLockNeedsFreshCanvasGesture) return { allowed: true }
+  if (hasRecentPointerLockUserGesture()) return { allowed: true }
+  return { allowed: false, reason: 'needs-fresh-canvas-gesture' }
+}
+
+function noteBlockedPointerLockRequest(source: string, target: Element, reason: string) {
+  pointerLockGuardState.blockedRequests++
+  pointerLockGuardState.lastRequestSource = source
+  pointerLockGuardState.lastRequestTarget = describeElementTarget(target)
+  pointerLockGuardState.lastBlockReason = reason
+  dispatchPointerLockError(target)
+}
+
+function noteAllowedPointerLockRequest(source: string, target: Element) {
+  pointerLockGuardState.allowedRequests++
+  pointerLockGuardState.lastRequestSource = source
+  pointerLockGuardState.lastRequestTarget = describeElementTarget(target)
+  pointerLockGuardState.lastBlockReason = undefined
+  pointerLockNeedsFreshCanvasGesture = false
+  pointerLockGuardState.needsFreshCanvasGesture = false
+  pointerLockAllowedRequestUntilMs = performance.now() + POINTER_LOCK_ALLOWED_REQUEST_GRACE_MS
+}
+
+function forceExitUnexpectedPointerLock(source: string) {
+  if (!document.pointerLockElement) return
+  pointerLockGuardState.forcedExits++
+  releaseExclusiveBrowserModes(source, false)
+  markPointerLockNeedsFreshGesture()
+}
+
+function releaseUnexpectedPointerLockIfNeeded(source: string) {
+  if (!document.pointerLockElement) return
+  if (!pointerLockNeedsFreshCanvasGesture || hasRecentPointerLockUserGesture()) return
+  forceExitUnexpectedPointerLock(source)
+}
+
+function installPointerLockReentryGuard() {
+  if (pointerLockGuardState.installed) return
+  pointerLockGuardState.installed = true
+
+  window.__CS_POINTER_LOCK_GUARD__ = {
+    snapshot: () => ({ ...pointerLockGuardState }),
   }
 
-  if (exclusiveModeGuardState.browserFullscreenAllowed) return
+  for (const eventName of ['pointerdown', 'mousedown', 'click']) {
+    document.addEventListener(eventName, noteTrustedCanvasGesture, { capture: true, passive: true })
+  }
 
-  const originalRequestFullscreen = Element.prototype.requestFullscreen
-  if (typeof originalRequestFullscreen === 'function') {
-    Object.defineProperty(Element.prototype, 'requestFullscreen', {
+  const elementPrototype = Element.prototype as PointerLockRequestElement
+  const originalRequestPointerLock = elementPrototype.requestPointerLock
+  if (typeof originalRequestPointerLock === 'function') {
+    Object.defineProperty(elementPrototype, 'requestPointerLock', {
       configurable: true,
       writable: true,
-      value(this: Element) {
-        noteBlockedFullscreenRequest('requestFullscreen', this)
-        return Promise.resolve()
+      value(this: Element, options?: PointerLockOptions) {
+        pointerLockGuardState.requestAttempts++
+        const decision = shouldAllowPointerLockRequest(this)
+        if (!decision.allowed) {
+          noteBlockedPointerLockRequest('requestPointerLock', this, decision.reason ?? 'blocked')
+          return Promise.resolve()
+        }
+        noteAllowedPointerLockRequest('requestPointerLock', this)
+        const result = originalRequestPointerLock.call(this, options)
+        return result ?? Promise.resolve()
       },
     })
   }
 
-  const webkitElementPrototype = Element.prototype as FullscreenRequestElement
-  if (typeof webkitElementPrototype.webkitRequestFullscreen === 'function') {
-    Object.defineProperty(webkitElementPrototype, 'webkitRequestFullscreen', {
+  if (typeof elementPrototype.webkitRequestPointerLock === 'function') {
+    const originalWebkitRequestPointerLock = elementPrototype.webkitRequestPointerLock
+    Object.defineProperty(elementPrototype, 'webkitRequestPointerLock', {
       configurable: true,
       writable: true,
       value(this: Element) {
-        noteBlockedFullscreenRequest('webkitRequestFullscreen', this)
+        pointerLockGuardState.requestAttempts++
+        const decision = shouldAllowPointerLockRequest(this)
+        if (!decision.allowed) {
+          noteBlockedPointerLockRequest('webkitRequestPointerLock', this, decision.reason ?? 'blocked')
+          return
+        }
+        noteAllowedPointerLockRequest('webkitRequestPointerLock', this)
+        originalWebkitRequestPointerLock.call(this)
       },
     })
   }
-
-  document.addEventListener('fullscreenchange', () => forceExitBrowserFullscreen('fullscreenchange'))
-  document.addEventListener('webkitfullscreenchange', () => forceExitBrowserFullscreen('webkitfullscreenchange'))
 }
 
 function releaseExclusiveBrowserModesOnHidden() {
   if (!document.hidden) return
+  markPointerLockNeedsFreshGesture()
   releaseExclusiveBrowserModes('visibility-hidden', true)
 }
 
 function handlePointerLockChange() {
   if (document.pointerLockElement) {
+    if (pointerLockNeedsFreshCanvasGesture && !hasRecentPointerLockUserGesture()) {
+      forceExitUnexpectedPointerLock('pointerlockchange-untrusted-lock')
+      return
+    }
     pointerLockWasActive = true
     pointerLockRecentlyReleased = false
+    pointerLockNeedsFreshCanvasGesture = false
+    pointerLockGuardState.needsFreshCanvasGesture = false
     return
   }
 
+  markPointerLockNeedsFreshGesture()
   if (!pointerLockWasActive) return
   pointerLockRecentlyReleased = true
   releaseExclusiveBrowserModes('pointerlockchange-unlocked', false)
@@ -637,12 +732,14 @@ function handlePointerLockChange() {
 
 function handleWindowBlur() {
   if (pointerLockWasActive || pointerLockRecentlyReleased || document.pointerLockElement) {
+    markPointerLockNeedsFreshGesture()
     pointerLockRecentlyReleased = true
     releaseExclusiveBrowserModes('window-blur', true)
   }
 }
 
 function handleWindowFocus() {
+  releaseUnexpectedPointerLockIfNeeded('window-focus-untrusted-lock')
   if (pointerLockRecentlyReleased && !document.pointerLockElement) {
     releaseKeyboardLock()
     blurExclusiveFocusTarget()
@@ -664,6 +761,7 @@ function handleAudioVisibilityChange() {
     return
   }
 
+  releaseUnexpectedPointerLockIfNeeded('visibility-visible-untrusted-lock')
   if (audioSuspendedForHiddenTab) {
     audioSuspendedForHiddenTab = false
     audioBackendState.suspendedForHiddenTab = false
@@ -902,7 +1000,7 @@ function installAudioContextHints() {
 }
 
 installAudioContextHints()
-installBrowserFullscreenGuard()
+installPointerLockReentryGuard()
 
 // ---------------------------------------------------------------------------
 // Runtime globals and launch logic
