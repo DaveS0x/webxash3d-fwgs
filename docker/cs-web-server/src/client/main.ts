@@ -10,6 +10,16 @@ declare global {
       playerName?: string
     }
     __CS_START_RUNTIME?: (playerName: string) => boolean
+    __CS_CAMERA?: {
+      ready: () => boolean
+      exec: (command: unknown) => boolean
+      setMode: (mode: unknown) => boolean
+      cycleTeam: (team?: unknown) => { ok: boolean; targetChanged: boolean }
+    }
+    __CS_CAMERA_ACTIVE?: boolean
+    __xash?: Xash3DWebRTC
+    __mapReady?: Promise<unknown>
+    __mapBytes?: ArrayBuffer | Uint8Array | null
     __mapName?: string | null
     Module?: {
       print?: (text: unknown) => void
@@ -18,6 +28,9 @@ declare global {
     }
   }
 }
+
+const buildEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}
+const RUNTIME_ASSET_VERSION = buildEnv.VITE_CS_RUNTIME_ASSET_VERSION ?? '20260427soundbuf1'
 
 const touchControls = document.getElementById('touchControls') as HTMLInputElement
 touchControls.addEventListener('change', () => {
@@ -71,6 +84,37 @@ function beginRuntimeLaunch(playerName: string) {
 
 function stripBspExtension(raw?: string | null) {
   return (raw ?? '').replace(/\.bsp$/i, '')
+}
+
+function withAssetVersion(url: string) {
+  const separator = url.includes('?') ? '&' : '?'
+  return `${url}${separator}v=${RUNTIME_ASSET_VERSION}`
+}
+
+function installRuntimeGlobals(x: Xash3DWebRTC) {
+  window.__xash = x
+  window.__CS_CAMERA_ACTIVE = new URLSearchParams(window.location.search).get('camera') === '1'
+  window.__CS_CAMERA = {
+    ready: () => true,
+    exec: (command: unknown) => {
+      const normalized = String(command ?? '').trim()
+      if (!normalized) return false
+      x.Cmd_ExecuteString(normalized)
+      return true
+    },
+    setMode: (mode: unknown) => {
+      const normalized = Math.max(1, Math.min(6, Math.floor(Number(mode))))
+      x.Cmd_ExecuteString(`specmode ${normalized}`)
+      x.Cmd_ExecuteString(`spec_mode ${normalized}`)
+      return true
+    },
+    cycleTeam: (team?: unknown) => {
+      const raw = String(team ?? 'any').trim().toLowerCase()
+      const target = raw === 'ct' || raw === 't' ? raw : 'any'
+      x.Cmd_ExecuteString(`spec_cycle_team ${target}`)
+      return { ok: true, targetChanged: true }
+    },
+  }
 }
 
 function installModuleLogProgressHooks() {
@@ -165,7 +209,7 @@ async function main() {
   const username = await usernamePromise
   installModuleLogProgressHooks()
 
-  const x = new Xash3DWebRTC({
+  const runtimeOptions = {
     canvas: document.getElementById('canvas') as HTMLCanvasElement,
     arguments: config.arguments || ['-windowed'],
     libraries: {
@@ -173,19 +217,21 @@ async function main() {
       xash: xashURL,
       menu: config.libraries.menu,
       server: config.libraries.server,
-      client: config.libraries.client,
+      client: withAssetVersion(config.libraries.client),
       render: {
         gl4es: gl4esURL,
       }
     },
     dynamicLibraries: config.dynamic_libraries,
     filesMap: config.files_map,
-  })
+  } as ConstructorParameters<typeof Xash3DWebRTC>[0]
+
+  const x = new Xash3DWebRTC(runtimeOptions)
 
   const initPromise = x.init()
   const [zip, extras] = await Promise.all([
     (async () => {
-      const res = await fetchWithProgress('valve.zip')
+      const res = await fetchWithProgress(`valve.zip?v=${RUNTIME_ASSET_VERSION}`)
       return await loadAsync(res)
     })(),
     (async () => {
@@ -193,6 +239,15 @@ async function main() {
       return await res.arrayBuffer()
     })(),
   ])
+
+  setLoadProgress('initializing', 0.35)
+  await initPromise
+  setLoadProgress('initializing', 1)
+
+  const em = x.em
+  if (!em) {
+    throw new Error('Xash runtime initialized without Emscripten interface')
+  }
 
   const files = Object.entries(zip.files).filter(([, file]) => !file.dir)
   const totalFiles = Math.max(1, files.length)
@@ -203,19 +258,20 @@ async function main() {
     const path = '/rodir/' + filename
     const dir = path.split('/').slice(0, -1).join('/')
 
-    x.em.FS.mkdirTree(dir)
-    x.em.FS.writeFile(path, await file.async('uint8array'))
+    em.FS.mkdirTree(dir)
+    em.FS.writeFile(path, await file.async('uint8array'))
     extractedFiles += 1
     setLoadProgress('extracting', extractedFiles / totalFiles)
   }
 
-  setLoadProgress('initializing', 0.35)
-  await initPromise
-  setLoadProgress('initializing', 1)
-
-  x.em.FS.mkdirTree(`/rodir/${config.game_dir}`)
-  x.em.FS.writeFile(`/rodir/${config.game_dir}/extras.pk3`, new Uint8Array(extras))
-  x.em.FS.chdir('/rodir')
+  em.FS.mkdirTree(`/rodir/${config.game_dir}`)
+  em.FS.writeFile(`/rodir/${config.game_dir}/extras.pk3`, new Uint8Array(extras))
+  em.FS.mkdirTree('/rodir/cstrike/maps')
+  await window.__mapReady
+  if (window.__mapBytes && window.__mapName) {
+    em.FS.writeFile(`/rodir/cstrike/maps/${window.__mapName}`, new Uint8Array(window.__mapBytes))
+  }
+  em.FS.chdir('/rodir')
 
   const logo = document.getElementById('logo') as HTMLImageElement | null
   if (logo) {
@@ -225,7 +281,16 @@ async function main() {
     logo.style.animationDirection = 'normal'
   }
 
+  installRuntimeGlobals(x)
   x.main()
+  if (window.__CS_CAMERA_ACTIVE) {
+    x.Cmd_ExecuteString('hideweapon 127')
+    x.Cmd_ExecuteString('cl_hidehud 127')
+    x.Cmd_ExecuteString('crosshair 0')
+    x.Cmd_ExecuteString('con_color "0 0 0"')
+    x.Cmd_ExecuteString('con_alpha 0')
+    x.Cmd_ExecuteString('con_notifytime 0')
+  }
   if (touchControls.checked) {
     x.Cmd_ExecuteString('touch_enable 1')
   }
