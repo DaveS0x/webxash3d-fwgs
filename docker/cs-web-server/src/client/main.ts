@@ -34,6 +34,7 @@ type AudioBackendSnapshot = {
   lastResumeSource?: string
   hiddenSuspendEnabled: boolean
   suspendedForHiddenTab: boolean
+  suspendedForPageExitPrompt: boolean
   suspendAttempts: number
   suspendSuccesses: number
   suspendFailures: number
@@ -185,6 +186,7 @@ const audioBackendState: Omit<
   resumeFailures: 0,
   hiddenSuspendEnabled: true,
   suspendedForHiddenTab: false,
+  suspendedForPageExitPrompt: false,
   suspendAttempts: 0,
   suspendSuccesses: 0,
   suspendFailures: 0,
@@ -199,6 +201,7 @@ const audioBackendState: Omit<
 let lastAudioContext: AudioContext | undefined
 const instrumentedAudioContexts = new WeakSet<AudioContext>()
 let audioSuspendedForHiddenTab = false
+let audioSuspendedForPageExitPrompt = false
 
 // ---------------------------------------------------------------------------
 // Ring buffer state (set up once the worklet module loads)
@@ -403,9 +406,21 @@ function getAudioContextForResume(): AudioContext | undefined {
   return window.SDL2?.audioContext ?? lastAudioContext
 }
 
+type AudioSuspendOptions = {
+  markHiddenTab?: boolean
+  pageExitPrompt?: boolean
+  resumeIfVisibleAfterSuspend?: boolean
+}
+
+function clearPageExitPromptAudioSuspend() {
+  audioSuspendedForPageExitPrompt = false
+  audioBackendState.suspendedForPageExitPrompt = false
+}
+
 function tryResumeAudioContext(source: string): boolean {
   const context = getAudioContextForResume()
   audioBackendState.lastResumeSource = source
+  clearPageExitPromptAudioSuspend()
   if (!context || typeof context.resume !== 'function') return false
   if (context.state !== 'suspended') return false
 
@@ -419,31 +434,57 @@ function tryResumeAudioContext(source: string): boolean {
   return true
 }
 
-function trySuspendAudioContext(source: string): boolean {
+function trySuspendAudioContext(source: string, options: AudioSuspendOptions = {}): boolean {
+  const markHiddenTab = options.markHiddenTab ?? true
+  const pageExitPrompt = options.pageExitPrompt ?? false
+  const resumeIfVisibleAfterSuspend = options.resumeIfVisibleAfterSuspend ?? true
   const context = getAudioContextForResume()
   audioBackendState.lastSuspendSource = source
   if (!context || typeof context.suspend !== 'function') return false
   if (context.state !== 'running') return false
 
   audioBackendState.suspendAttempts++
-  audioSuspendedForHiddenTab = true
-  audioBackendState.suspendedForHiddenTab = true
+  if (markHiddenTab) {
+    audioSuspendedForHiddenTab = true
+    audioBackendState.suspendedForHiddenTab = true
+  }
+  if (pageExitPrompt) {
+    audioSuspendedForPageExitPrompt = true
+    audioBackendState.suspendedForPageExitPrompt = true
+  }
   void context.suspend()
     .then(() => {
       audioBackendState.suspendSuccesses++
-      if (!document.hidden) {
+      if (resumeIfVisibleAfterSuspend && !document.hidden) {
         audioSuspendedForHiddenTab = false
         audioBackendState.suspendedForHiddenTab = false
         tryResumeAudioContext('visibilitychange-race')
+      } else if (pageExitPrompt && !document.hidden && !audioSuspendedForPageExitPrompt) {
+        tryResumeAudioContext(`${source}-cancel-race`)
       }
     })
     .catch((error: unknown) => {
-      audioSuspendedForHiddenTab = false
-      audioBackendState.suspendedForHiddenTab = false
+      if (markHiddenTab) {
+        audioSuspendedForHiddenTab = false
+        audioBackendState.suspendedForHiddenTab = false
+      }
+      if (pageExitPrompt) clearPageExitPromptAudioSuspend()
       audioBackendState.suspendFailures++
       audioBackendState.lastError = error instanceof Error ? error.message : String(error)
     })
   return true
+}
+
+function suspendAudioForPageExitPrompt(source: string) {
+  trySuspendAudioContext(source, {
+    markHiddenTab: false,
+    pageExitPrompt: true,
+    resumeIfVisibleAfterSuspend: false,
+  })
+
+  window.setTimeout(() => {
+    if (!document.hidden) tryResumeAudioContext(`${source}-cancel`)
+  }, 0)
 }
 
 function releaseExclusiveBrowserModesOnHidden() {
@@ -1202,7 +1243,15 @@ async function main() {
   setLoadProgress('connecting', 1)
   x.Cmd_ExecuteString('connect 127.0.0.1:8080')
 
+  window.addEventListener('pagehide', () => {
+    trySuspendAudioContext('pagehide', {
+      markHiddenTab: false,
+      resumeIfVisibleAfterSuspend: false,
+    })
+  })
+  window.addEventListener('pageshow', () => tryResumeAudioContext('pageshow'))
   window.addEventListener('beforeunload', (event) => {
+    suspendAudioForPageExitPrompt('beforeunload')
     event.preventDefault()
     event.returnValue = ''
     return ''
