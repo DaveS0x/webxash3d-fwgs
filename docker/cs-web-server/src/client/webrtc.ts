@@ -190,6 +190,8 @@ export class Xash3DWebRTC extends Xash3D {
 
     sendto(packet: Packet) {
         if (!this.channel) return
-        this.channel.send(packet.data)
+        const payload = new Uint8Array(packet.data.byteLength)
+        payload.set(packet.data)
+        this.channel.send(payload)
     }
 }
