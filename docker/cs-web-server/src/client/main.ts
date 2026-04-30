@@ -202,6 +202,8 @@ let lastAudioContext: AudioContext | undefined
 const instrumentedAudioContexts = new WeakSet<AudioContext>()
 let audioSuspendedForHiddenTab = false
 let audioSuspendedForPageExitPrompt = false
+let pointerLockWasActive = false
+let pointerLockRecentlyReleased = false
 
 // ---------------------------------------------------------------------------
 // Ring buffer state (set up once the worklet module loads)
@@ -487,9 +489,28 @@ function suspendAudioForPageExitPrompt(source: string) {
   }, 0)
 }
 
-function releaseExclusiveBrowserModesOnHidden() {
-  if (!document.hidden) return
+function blurExclusiveFocusTarget() {
+  const canvas = document.getElementById('canvas') as HTMLCanvasElement | null
+  if (document.activeElement === canvas || document.activeElement === document.body) {
+    const activeElement = document.activeElement as HTMLElement | null
+    activeElement?.blur?.()
+  }
+  canvas?.blur?.()
+}
 
+function releaseKeyboardLock() {
+  const keyboard = (navigator as Navigator & {
+    keyboard?: { unlock?: () => void }
+  }).keyboard
+  try {
+    keyboard?.unlock?.()
+  } catch {
+    // Best-effort cleanup only.
+  }
+}
+
+function releaseExclusiveBrowserModes(source: string, exitFullscreen: boolean) {
+  void source
   if (document.pointerLockElement && typeof document.exitPointerLock === 'function') {
     try {
       document.exitPointerLock()
@@ -498,9 +519,49 @@ function releaseExclusiveBrowserModesOnHidden() {
     }
   }
 
-  if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+  if (exitFullscreen && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
     void document.exitFullscreen().catch(() => undefined)
   }
+
+  if (pointerLockWasActive || pointerLockRecentlyReleased) {
+    releaseKeyboardLock()
+    blurExclusiveFocusTarget()
+    window.setTimeout(blurExclusiveFocusTarget, 0)
+    window.setTimeout(blurExclusiveFocusTarget, 100)
+  }
+}
+
+function releaseExclusiveBrowserModesOnHidden() {
+  if (!document.hidden) return
+  releaseExclusiveBrowserModes('visibility-hidden', true)
+}
+
+function handlePointerLockChange() {
+  if (document.pointerLockElement) {
+    pointerLockWasActive = true
+    pointerLockRecentlyReleased = false
+    return
+  }
+
+  if (!pointerLockWasActive) return
+  pointerLockRecentlyReleased = true
+  releaseExclusiveBrowserModes('pointerlockchange-unlocked', false)
+}
+
+function handleWindowBlur() {
+  if (pointerLockWasActive || pointerLockRecentlyReleased || document.pointerLockElement) {
+    pointerLockRecentlyReleased = true
+    releaseExclusiveBrowserModes('window-blur', true)
+  }
+}
+
+function handleWindowFocus() {
+  if (pointerLockRecentlyReleased && !document.pointerLockElement) {
+    releaseKeyboardLock()
+    blurExclusiveFocusTarget()
+    window.setTimeout(() => { pointerLockRecentlyReleased = false }, 250)
+  }
+  tryResumeAudioContext('focus')
 }
 
 function handleAudioVisibilityChange() {
@@ -701,8 +762,10 @@ function installAudioContextHints() {
   for (const eventName of ['click', 'keydown', 'touchstart', 'mousedown', 'pointerdown']) {
     document.addEventListener(eventName, () => tryResumeAudioContext(eventName), { passive: true })
   }
+  document.addEventListener('pointerlockchange', handlePointerLockChange)
   document.addEventListener('visibilitychange', handleAudioVisibilityChange)
-  window.addEventListener('focus', () => tryResumeAudioContext('focus'))
+  window.addEventListener('blur', handleWindowBlur)
+  window.addEventListener('focus', handleWindowFocus)
 
   let attempts = 0
   const interval = window.setInterval(() => {
