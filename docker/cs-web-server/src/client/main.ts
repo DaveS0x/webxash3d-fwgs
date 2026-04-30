@@ -3,13 +3,53 @@ import xashURL from 'xash3d-fwgs/xash.wasm?url'
 import gl4esURL from 'xash3d-fwgs/libref_webgl2.wasm?url'
 import { Xash3DWebRTC } from './webrtc'
 
+type AudioContextConstructor = {
+  new(options?: AudioContextOptions): AudioContext
+  prototype: AudioContext
+}
+
+type AudioBackendSnapshot = {
+  variant: string
+  enabled: boolean
+  installed: boolean
+  installReason?: string
+  requestedSampleRate?: number
+  requestedLatencyHint?: AudioContextOptions['latencyHint']
+  constructorCalls: number
+  constructorFallbacks: number
+  contextsCreated: number
+  actualSampleRate?: number
+  baseLatency?: number
+  outputLatency?: number
+  state?: AudioContextState
+  scriptProcessorCalls: number
+  lastScriptProcessorArgs?: {
+    bufferSize?: number
+    numberOfInputChannels?: number
+    numberOfOutputChannels?: number
+  }
+  resumeAttempts: number
+  resumeSuccesses: number
+  resumeFailures: number
+  lastResumeSource?: string
+  lastError?: string
+}
+
 declare global {
   interface Window {
+    webkitAudioContext?: AudioContextConstructor
     __CS_LOAD_PROGRESS_SET?: (stage: string, percent: number) => void
     __CS_RUNTIME_LAUNCH?: {
       playerName?: string
     }
     __CS_START_RUNTIME?: (playerName: string) => boolean
+    __CS_AUDIO_CONTEXT_HINTS?: boolean | string | number
+    __CS_AUDIO_CONTEXT_SAMPLE_RATE?: number | string
+    __CS_AUDIO_CONTEXT_LATENCY_HINT?: AudioContextOptions['latencyHint'] | string
+    __CS_AUDIO_BACKEND__?: {
+      snapshot: () => AudioBackendSnapshot
+      resumeNow: () => boolean
+    }
     __CS_CAMERA?: {
       ready: () => boolean
       exec: (command: unknown) => boolean
@@ -21,6 +61,12 @@ declare global {
     __mapReady?: Promise<unknown>
     __mapBytes?: ArrayBuffer | Uint8Array | null
     __mapName?: string | null
+    SDL2?: {
+      audioContext?: AudioContext
+      audio?: {
+        scriptProcessorNode?: ScriptProcessorNode
+      }
+    }
     Module?: {
       print?: (text: unknown) => void
       printErr?: (text: unknown) => void
@@ -31,6 +77,22 @@ declare global {
 
 const buildEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}
 const RUNTIME_ASSET_VERSION = buildEnv.VITE_CS_RUNTIME_ASSET_VERSION ?? '20260427soundbuf1'
+const AUDIO_BACKEND_VARIANT = 'audioctx-hints-20260428a'
+
+const audioBackendState: Omit<AudioBackendSnapshot, 'state' | 'actualSampleRate' | 'baseLatency' | 'outputLatency'> = {
+  variant: AUDIO_BACKEND_VARIANT,
+  enabled: false,
+  installed: false,
+  constructorCalls: 0,
+  constructorFallbacks: 0,
+  contextsCreated: 0,
+  scriptProcessorCalls: 0,
+  resumeAttempts: 0,
+  resumeSuccesses: 0,
+  resumeFailures: 0,
+}
+let lastAudioContext: AudioContext | undefined
+const instrumentedAudioContexts = new WeakSet<AudioContext>()
 
 const touchControls = document.getElementById('touchControls') as HTMLInputElement
 touchControls.addEventListener('change', () => {
@@ -90,6 +152,247 @@ function withAssetVersion(url: string) {
   const separator = url.includes('?') ? '&' : '?'
   return `${url}${separator}v=${RUNTIME_ASSET_VERSION}`
 }
+
+function parseBooleanFlag(value: unknown, defaultValue: boolean): boolean {
+  if (value == null || value === '') return defaultValue
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  const normalized = String(value).trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return true
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return false
+  return defaultValue
+}
+
+function readStorageSetting(name: string): string | null {
+  try {
+    return sessionStorage.getItem(name) ?? localStorage.getItem(name)
+  } catch {
+    return null
+  }
+}
+
+function readSetting(name: string, queryNames: string[], envValue?: string): string | undefined {
+  const globalValue = (window as unknown as Record<string, unknown>)[name]
+  if (globalValue != null) return String(globalValue)
+
+  const query = new URLSearchParams(window.location.search)
+  for (const queryName of queryNames) {
+    if (query.has(queryName)) return query.get(queryName) ?? ''
+  }
+
+  const storageValue = readStorageSetting(name)
+  if (storageValue != null) return storageValue
+
+  return envValue
+}
+
+function readBooleanSetting(
+  name: string,
+  queryNames: string[],
+  envValue: string | undefined,
+  defaultValue: boolean,
+): boolean {
+  return parseBooleanFlag(readSetting(name, queryNames, envValue), defaultValue)
+}
+
+function readNumberSetting(
+  name: string,
+  queryNames: string[],
+  envValue: string | undefined,
+  defaultValue: number | undefined,
+): number | undefined {
+  const raw = readSetting(name, queryNames, envValue)
+  if (raw == null || raw === '') return defaultValue
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue
+}
+
+function readLatencyHintSetting(): AudioContextOptions['latencyHint'] | undefined {
+  const raw = readSetting(
+    '__CS_AUDIO_CONTEXT_LATENCY_HINT',
+    ['cs_audio_latency_hint', 'audio_latency_hint'],
+    buildEnv.VITE_CS_AUDIO_CONTEXT_LATENCY_HINT,
+  )
+  if (raw == null || raw === '') return undefined
+  const normalized = raw.trim().toLowerCase()
+  if (normalized === 'interactive' || normalized === 'balanced' || normalized === 'playback') {
+    return normalized
+  }
+  const parsed = Number(normalized)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
+}
+
+function audioContextSnapshot(): AudioBackendSnapshot {
+  const context = window.SDL2?.audioContext ?? lastAudioContext
+  const latencyContext = context as (AudioContext & { outputLatency?: number }) | undefined
+  return {
+    ...audioBackendState,
+    actualSampleRate: context?.sampleRate,
+    baseLatency: latencyContext?.baseLatency,
+    outputLatency: latencyContext?.outputLatency,
+    state: context?.state,
+  }
+}
+
+function getAudioContextForResume(): AudioContext | undefined {
+  return window.SDL2?.audioContext ?? lastAudioContext
+}
+
+function tryResumeAudioContext(source: string): boolean {
+  const context = getAudioContextForResume()
+  audioBackendState.lastResumeSource = source
+  if (!context || typeof context.resume !== 'function') {
+    return false
+  }
+  if (context.state !== 'suspended') {
+    return false
+  }
+
+  audioBackendState.resumeAttempts += 1
+  void context.resume()
+    .then(() => {
+      audioBackendState.resumeSuccesses += 1
+    })
+    .catch((error: unknown) => {
+      audioBackendState.resumeFailures += 1
+      audioBackendState.lastError = error instanceof Error ? error.message : String(error)
+    })
+  return true
+}
+
+function instrumentAudioContext(context: AudioContext): AudioContext {
+  if (instrumentedAudioContexts.has(context)) {
+    return context
+  }
+  instrumentedAudioContexts.add(context)
+  lastAudioContext = context
+  audioBackendState.contextsCreated += 1
+
+  try {
+    const originalCreateScriptProcessor = context.createScriptProcessor
+    context.createScriptProcessor = function (...args: Parameters<AudioContext['createScriptProcessor']>) {
+      audioBackendState.scriptProcessorCalls += 1
+      audioBackendState.lastScriptProcessorArgs = {
+        bufferSize: args[0],
+        numberOfInputChannels: args[1],
+        numberOfOutputChannels: args[2],
+      }
+      return originalCreateScriptProcessor.apply(this, args)
+    }
+  } catch (error) {
+    audioBackendState.lastError = error instanceof Error ? error.message : String(error)
+  }
+
+  try {
+    context.addEventListener('statechange', () => {
+      lastAudioContext = context
+    })
+  } catch {
+    // best-effort diagnostics only
+  }
+
+  return context
+}
+
+function copyAudioContextConstructorProperties(
+  target: AudioContextConstructor,
+  source: AudioContextConstructor,
+) {
+  Object.setPrototypeOf(target, source)
+  for (const key of Reflect.ownKeys(source)) {
+    if (key === 'length' || key === 'name' || key === 'prototype') continue
+    const descriptor = Object.getOwnPropertyDescriptor(source, key)
+    if (!descriptor) continue
+    try {
+      Object.defineProperty(target, key, descriptor)
+    } catch {
+      // Some browser-owned constructor properties are intentionally locked.
+    }
+  }
+}
+
+function installAudioContextHints() {
+  const enabled = readBooleanSetting(
+    '__CS_AUDIO_CONTEXT_HINTS',
+    ['cs_audio_context_hints', 'audio_context_hints', 'audioctx'],
+    buildEnv.VITE_CS_AUDIO_CONTEXT_HINTS,
+    false,
+  )
+  const requestedSampleRate = enabled
+    ? readNumberSetting(
+      '__CS_AUDIO_CONTEXT_SAMPLE_RATE',
+      ['cs_audio_sample_rate', 'audio_sample_rate'],
+      buildEnv.VITE_CS_AUDIO_CONTEXT_SAMPLE_RATE,
+      22050,
+    )
+    : undefined
+  const requestedLatencyHint = enabled ? (readLatencyHintSetting() ?? 'playback') : undefined
+
+  audioBackendState.enabled = enabled
+  audioBackendState.requestedSampleRate = requestedSampleRate
+  audioBackendState.requestedLatencyHint = requestedLatencyHint
+  window.__CS_AUDIO_BACKEND__ = {
+    snapshot: audioContextSnapshot,
+    resumeNow: () => tryResumeAudioContext('manual'),
+  }
+
+  if (!enabled) {
+    audioBackendState.installReason = 'disabled'
+    return
+  }
+
+  const OriginalAudioContext = window.AudioContext ?? window.webkitAudioContext
+  if (!OriginalAudioContext) {
+    audioBackendState.installReason = 'missing-audio-context'
+    return
+  }
+
+  const WrappedAudioContext = function (options?: AudioContextOptions) {
+    audioBackendState.constructorCalls += 1
+    const requestedOptions: AudioContextOptions = {
+      ...(options && typeof options === 'object' ? options : {}),
+    }
+    if (requestedSampleRate != null) requestedOptions.sampleRate = requestedSampleRate
+    if (requestedLatencyHint != null) requestedOptions.latencyHint = requestedLatencyHint
+
+    try {
+      return instrumentAudioContext(new OriginalAudioContext(requestedOptions))
+    } catch (error) {
+      audioBackendState.constructorFallbacks += 1
+      audioBackendState.lastError = error instanceof Error ? error.message : String(error)
+      const fallbackOptions: AudioContextOptions = {}
+      if (requestedLatencyHint != null) fallbackOptions.latencyHint = requestedLatencyHint
+      return instrumentAudioContext(new OriginalAudioContext(fallbackOptions))
+    }
+  } as unknown as AudioContextConstructor
+
+  WrappedAudioContext.prototype = OriginalAudioContext.prototype
+  copyAudioContextConstructorProperties(WrappedAudioContext, OriginalAudioContext)
+  window.AudioContext = WrappedAudioContext
+  window.webkitAudioContext = WrappedAudioContext
+  audioBackendState.installed = true
+  audioBackendState.installReason = 'installed'
+
+  for (const eventName of ['click', 'keydown', 'touchstart', 'mousedown', 'pointerdown']) {
+    document.addEventListener(eventName, () => tryResumeAudioContext(eventName), { passive: true })
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) tryResumeAudioContext('visibilitychange')
+  })
+  window.addEventListener('focus', () => tryResumeAudioContext('focus'))
+
+  let attempts = 0
+  const interval = window.setInterval(() => {
+    attempts += 1
+    tryResumeAudioContext('boot-interval')
+    const context = getAudioContextForResume()
+    if (attempts >= 60 || context?.state === 'running') {
+      window.clearInterval(interval)
+    }
+  }, 500)
+}
+
+installAudioContextHints()
 
 function installRuntimeGlobals(x: Xash3DWebRTC) {
   window.__xash = x
