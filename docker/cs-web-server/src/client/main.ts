@@ -32,6 +32,12 @@ type AudioBackendSnapshot = {
   resumeSuccesses: number
   resumeFailures: number
   lastResumeSource?: string
+  hiddenSuspendEnabled: boolean
+  suspendedForHiddenTab: boolean
+  suspendAttempts: number
+  suspendSuccesses: number
+  suspendFailures: number
+  lastSuspendSource?: string
   lastError?: string
   // worklet bridge fields
   crossOriginIsolated: boolean
@@ -118,6 +124,7 @@ declare global {
     __CS_AUDIO_CONTEXT_SAMPLE_RATE?: number | string
     __CS_AUDIO_CONTEXT_LATENCY_HINT?: AudioContextOptions['latencyHint'] | string
     __CS_AUDIO_WORKLET_BRIDGE?: boolean | string | number
+    __CS_AUDIO_HIDDEN_SUSPEND?: boolean | string | number
     __CS_AUDIO_BACKEND__?: {
       snapshot: () => AudioBackendSnapshot
       resumeNow: () => boolean
@@ -175,6 +182,11 @@ const audioBackendState: Omit<
   resumeAttempts: 0,
   resumeSuccesses: 0,
   resumeFailures: 0,
+  hiddenSuspendEnabled: true,
+  suspendedForHiddenTab: false,
+  suspendAttempts: 0,
+  suspendSuccesses: 0,
+  suspendFailures: 0,
   workletBridgeEnabled: false,
   workletBridgeInstalled: false,
   sdlCallbackCount: 0,
@@ -185,6 +197,7 @@ const audioBackendState: Omit<
 
 let lastAudioContext: AudioContext | undefined
 const instrumentedAudioContexts = new WeakSet<AudioContext>()
+let audioSuspendedForHiddenTab = false
 
 // ---------------------------------------------------------------------------
 // Ring buffer state (set up once the worklet module loads)
@@ -405,6 +418,51 @@ function tryResumeAudioContext(source: string): boolean {
   return true
 }
 
+function trySuspendAudioContext(source: string): boolean {
+  const context = getAudioContextForResume()
+  audioBackendState.lastSuspendSource = source
+  if (!context || typeof context.suspend !== 'function') return false
+  if (context.state !== 'running') return false
+
+  audioBackendState.suspendAttempts++
+  audioSuspendedForHiddenTab = true
+  audioBackendState.suspendedForHiddenTab = true
+  void context.suspend()
+    .then(() => {
+      audioBackendState.suspendSuccesses++
+      if (!document.hidden) {
+        audioSuspendedForHiddenTab = false
+        audioBackendState.suspendedForHiddenTab = false
+        tryResumeAudioContext('visibilitychange-race')
+      }
+    })
+    .catch((error: unknown) => {
+      audioSuspendedForHiddenTab = false
+      audioBackendState.suspendedForHiddenTab = false
+      audioBackendState.suspendFailures++
+      audioBackendState.lastError = error instanceof Error ? error.message : String(error)
+    })
+  return true
+}
+
+function handleAudioVisibilityChange() {
+  if (!audioBackendState.hiddenSuspendEnabled) {
+    if (!document.hidden) tryResumeAudioContext('visibilitychange')
+    return
+  }
+
+  if (document.hidden) {
+    trySuspendAudioContext('visibilitychange')
+    return
+  }
+
+  if (audioSuspendedForHiddenTab) {
+    audioSuspendedForHiddenTab = false
+    audioBackendState.suspendedForHiddenTab = false
+  }
+  tryResumeAudioContext('visibilitychange')
+}
+
 function instrumentAudioContext(context: AudioContext): AudioContext {
   if (instrumentedAudioContexts.has(context)) return context
   instrumentedAudioContexts.add(context)
@@ -551,6 +609,13 @@ function installAudioContextHints() {
     false,
   )
 
+  const hiddenSuspendEnabled = readBooleanSetting(
+    '__CS_AUDIO_HIDDEN_SUSPEND',
+    ['raf_hidden_mute', 'audio_hidden_suspend', 'cs_audio_hidden_suspend'],
+    buildEnv.VITE_CS_AUDIO_HIDDEN_SUSPEND,
+    true,
+  )
+
   const requestedSampleRate = enabled
     ? readNumberSetting(
       '__CS_AUDIO_CONTEXT_SAMPLE_RATE',
@@ -563,6 +628,7 @@ function installAudioContextHints() {
 
   audioBackendState.enabled = enabled
   audioBackendState.workletBridgeEnabled = workletBridgeEnabled
+  audioBackendState.hiddenSuspendEnabled = hiddenSuspendEnabled
   audioBackendState.requestedSampleRate = requestedSampleRate
   audioBackendState.requestedLatencyHint = requestedLatencyHint
 
@@ -571,9 +637,23 @@ function installAudioContextHints() {
     resumeNow: () => tryResumeAudioContext('manual'),
   }
 
-  // If neither hints nor bridge are active, still expose diagnostics but do nothing else.
+  for (const eventName of ['click', 'keydown', 'touchstart', 'mousedown', 'pointerdown']) {
+    document.addEventListener(eventName, () => tryResumeAudioContext(eventName), { passive: true })
+  }
+  document.addEventListener('visibilitychange', handleAudioVisibilityChange)
+  window.addEventListener('focus', () => tryResumeAudioContext('focus'))
+
+  let attempts = 0
+  const interval = window.setInterval(() => {
+    attempts++
+    tryResumeAudioContext('boot-interval')
+    const context = getAudioContextForResume()
+    if (attempts >= 60 || context?.state === 'running') window.clearInterval(interval)
+  }, 500)
+
+  // If neither hints nor bridge are active, still expose diagnostics and hidden-tab audio suspend.
   if (!enabled && !workletBridgeEnabled) {
-    audioBackendState.installReason = 'disabled'
+    audioBackendState.installReason = hiddenSuspendEnabled ? 'hidden-suspend-only' : 'disabled'
     return
   }
 
@@ -608,22 +688,6 @@ function installAudioContextHints() {
   window.webkitAudioContext = WrappedAudioContext
   audioBackendState.installed = true
   audioBackendState.installReason = 'installed'
-
-  for (const eventName of ['click', 'keydown', 'touchstart', 'mousedown', 'pointerdown']) {
-    document.addEventListener(eventName, () => tryResumeAudioContext(eventName), { passive: true })
-  }
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) tryResumeAudioContext('visibilitychange')
-  })
-  window.addEventListener('focus', () => tryResumeAudioContext('focus'))
-
-  let attempts = 0
-  const interval = window.setInterval(() => {
-    attempts++
-    tryResumeAudioContext('boot-interval')
-    const context = getAudioContextForResume()
-    if (attempts >= 60 || context?.state === 'running') window.clearInterval(interval)
-  }, 500)
 }
 
 installAudioContextHints()
