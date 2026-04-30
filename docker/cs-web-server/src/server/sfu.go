@@ -620,6 +620,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !disabledXPoweredBy {
 		w.Header().Set("X-Powered-By", xPoweredByValue)
 	}
+	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+	w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
 	switch r.URL.Path {
 	case "/websocket":
 		websocketHandler(w, r)
