@@ -131,6 +131,16 @@ type XashModuleCallbacks = {
   nativeStallRender?: (event: NativeStallRenderEvent) => void
 }
 
+type RuntimeLaunchSpray = {
+  assetId?: unknown
+  wadUrl?: unknown
+  wadSha256?: unknown
+  wadSizeBytes?: unknown
+  width?: unknown
+  height?: unknown
+  textureName?: unknown
+}
+
 declare global {
   interface Window {
     webkitAudioContext?: AudioContextConstructor
@@ -138,6 +148,9 @@ declare global {
     __CS_LOAD_PROGRESS_SET?: (stage: string, percent: number) => void
     __CS_RUNTIME_LAUNCH?: {
       playerName?: string
+      account?: {
+        activeSpray?: RuntimeLaunchSpray
+      }
     }
     __CS_START_RUNTIME?: (playerName: string) => boolean
     __CS_AUDIO_CONTEXT_HINTS?: boolean | string | number
@@ -1059,6 +1072,80 @@ function withAssetVersion(url: string) {
   return `${url}${separator}v=${RUNTIME_ASSET_VERSION}`
 }
 
+function activeRuntimeSpray() {
+  const spray = window.__CS_RUNTIME_LAUNCH?.account?.activeSpray
+  if (!spray || typeof spray !== 'object') return null
+
+  const wadUrl = typeof spray.wadUrl === 'string' ? spray.wadUrl : ''
+  const wadSha256 = typeof spray.wadSha256 === 'string' ? spray.wadSha256.toLowerCase() : ''
+  const wadSizeBytes = Number(spray.wadSizeBytes)
+  if (
+    !wadUrl ||
+    !/^[a-f0-9]{64}$/.test(wadSha256) ||
+    !Number.isFinite(wadSizeBytes) ||
+    wadSizeBytes <= 0
+  ) {
+    return null
+  }
+
+  return {
+    assetId: typeof spray.assetId === 'string' ? spray.assetId : 'unknown',
+    wadUrl,
+    wadSha256,
+    wadSizeBytes: Math.floor(wadSizeBytes),
+  }
+}
+
+function bytesToHex(bytes: ArrayBuffer) {
+  return [...new Uint8Array(bytes)]
+    .map(value => value.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function sha256ArrayBuffer(buffer: ArrayBuffer) {
+  if (!window.crypto?.subtle) {
+    throw new Error('crypto.subtle is unavailable')
+  }
+  return bytesToHex(await window.crypto.subtle.digest('SHA-256', buffer))
+}
+
+async function mountActiveSprayWad(em: Xash3DWebRTC['em']) {
+  const spray = activeRuntimeSpray()
+  if (!spray || !em) return
+
+  try {
+    setLoadProgress('custom_spray', 0.15)
+    const response = await fetch(spray.wadUrl, {
+      cache: 'force-cache',
+      credentials: 'omit',
+    })
+    if (!response.ok) {
+      throw new Error(`spray WAD fetch returned ${response.status}`)
+    }
+
+    const buffer = await response.arrayBuffer()
+    if (buffer.byteLength !== spray.wadSizeBytes) {
+      throw new Error(`spray WAD size mismatch (${buffer.byteLength} !== ${spray.wadSizeBytes})`)
+    }
+
+    setLoadProgress('custom_spray', 0.65)
+    const hash = await sha256ArrayBuffer(buffer)
+    if (hash !== spray.wadSha256) {
+      throw new Error('spray WAD SHA-256 mismatch')
+    }
+
+    em.FS.mkdirTree('/rodir/cstrike')
+    em.FS.writeFile('/rodir/cstrike/tempdecal.wad', new Uint8Array(buffer))
+    setLoadProgress('custom_spray', 1)
+    console.log('[RuntimeLaunch] mounted active spray', {
+      assetId: spray.assetId,
+      sizeBytes: spray.wadSizeBytes,
+    })
+  } catch (error) {
+    console.warn('[RuntimeLaunch] active spray was not mounted', error)
+  }
+}
+
 function installRuntimeGlobals(x: Xash3DWebRTC) {
   window.__xash = x
   window.__CS_CAMERA_ACTIVE = new URLSearchParams(window.location.search).get('camera') === '1'
@@ -1082,6 +1169,21 @@ function installRuntimeGlobals(x: Xash3DWebRTC) {
       x.Cmd_ExecuteString(`spec_cycle_team ${target}`)
       return { ok: true, targetChanged: true }
     },
+  }
+}
+
+function applyCounterSolNativeUiSuppression(x: Xash3DWebRTC) {
+  const commands = [
+    'hideweapon 127',
+    'cl_hidehud 127',
+    'crosshair 0',
+    'con_notifytime 0',
+    '_vgui_menus 0',
+    'cl_hide_motd 1',
+  ]
+
+  for (const command of commands) {
+    x.Cmd_ExecuteString(command)
   }
 }
 
@@ -1456,6 +1558,7 @@ async function main() {
   if (window.__mapBytes && window.__mapName) {
     em.FS.writeFile(`/rodir/cstrike/maps/${window.__mapName}`, new Uint8Array(window.__mapBytes))
   }
+  await mountActiveSprayWad(em)
   em.FS.chdir('/rodir')
 
   const logo = document.getElementById('logo') as HTMLImageElement | null
@@ -1474,13 +1577,10 @@ async function main() {
   }
   x.main()
   x.Cmd_ExecuteString('gl_check_errors 0')
+  applyCounterSolNativeUiSuppression(x)
   if (window.__CS_CAMERA_ACTIVE) {
-    x.Cmd_ExecuteString('hideweapon 127')
-    x.Cmd_ExecuteString('cl_hidehud 127')
-    x.Cmd_ExecuteString('crosshair 0')
     x.Cmd_ExecuteString('con_color "0 0 0"')
     x.Cmd_ExecuteString('con_alpha 0')
-    x.Cmd_ExecuteString('con_notifytime 0')
   }
   if (touchControls.checked) x.Cmd_ExecuteString('touch_enable 1')
   x.Cmd_ExecuteString(`name "${username}"`)
