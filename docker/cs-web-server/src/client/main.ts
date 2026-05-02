@@ -141,6 +141,32 @@ type RuntimeLaunchSpray = {
   textureName?: unknown
 }
 
+type ActiveRuntimeSpray = {
+  assetId: string
+  wadUrl: string
+  wadSha256: string
+  wadSizeBytes: number
+}
+
+type SprayDebugEvent = {
+  timeMs: number
+  stage: string
+  detail: Record<string, unknown>
+}
+
+type SprayDebugSnapshot = {
+  activeSpray: ActiveRuntimeSpray | null
+  mounted: boolean
+  mountPaths: string[]
+  fsSizes: Record<string, number>
+  error?: string
+  events: SprayDebugEvent[]
+}
+
+type SprayDebugState = SprayDebugSnapshot & {
+  snapshot: () => SprayDebugSnapshot
+}
+
 declare global {
   interface Window {
     webkitAudioContext?: AudioContextConstructor
@@ -152,6 +178,7 @@ declare global {
         activeSpray?: RuntimeLaunchSpray
       }
     }
+    __CS_SPRAY_DEBUG__?: SprayDebugState
     __CS_START_RUNTIME?: (playerName: string) => boolean
     __CS_AUDIO_CONTEXT_HINTS?: boolean | string | number
     __CS_AUDIO_CONTEXT_SAMPLE_RATE?: number | string
@@ -200,6 +227,43 @@ declare global {
 const buildEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}
 const RUNTIME_ASSET_VERSION = buildEnv.VITE_CS_RUNTIME_ASSET_VERSION ?? '20260427soundbuf1'
 const AUDIO_BACKEND_VARIANT = 'aw-bridge-20260428a'
+const SPRAY_WAD_RUNTIME_PATHS = [
+  '/rodir/cstrike/countersol_tempdecal.wad',
+  '/rodir/cstrike/tempdecal.wad',
+]
+const SPRAY_DEBUG_EVENT_LIMIT = 80
+
+const sprayDebugState: SprayDebugState = {
+  activeSpray: null,
+  mounted: false,
+  mountPaths: [],
+  fsSizes: {},
+  events: [],
+  snapshot: () => ({
+    activeSpray: sprayDebugState.activeSpray,
+    mounted: sprayDebugState.mounted,
+    mountPaths: [...sprayDebugState.mountPaths],
+    fsSizes: { ...sprayDebugState.fsSizes },
+    error: sprayDebugState.error,
+    events: [...sprayDebugState.events],
+  }),
+}
+
+function recordSprayDebug(stage: string, detail: Record<string, unknown> = {}) {
+  window.__CS_SPRAY_DEBUG__ = sprayDebugState
+  const event = {
+    timeMs: Math.round(performance.now()),
+    stage,
+    detail,
+  }
+  sprayDebugState.events.push(event)
+  if (sprayDebugState.events.length > SPRAY_DEBUG_EVENT_LIMIT) {
+    sprayDebugState.events.splice(0, sprayDebugState.events.length - SPRAY_DEBUG_EVENT_LIMIT)
+  }
+  console.log(`[CounterSolSpray] ${stage}`, detail)
+}
+
+window.__CS_SPRAY_DEBUG__ = sprayDebugState
 
 // ---------------------------------------------------------------------------
 // Audio backend state
@@ -1093,7 +1157,7 @@ function activeRuntimeSpray() {
     wadUrl,
     wadSha256,
     wadSizeBytes: Math.floor(wadSizeBytes),
-  }
+  } satisfies ActiveRuntimeSpray
 }
 
 function bytesToHex(bytes: ArrayBuffer) {
@@ -1111,9 +1175,28 @@ async function sha256ArrayBuffer(buffer: ArrayBuffer) {
 
 async function mountActiveSprayWad(em: Xash3DWebRTC['em']) {
   const spray = activeRuntimeSpray()
-  if (!spray || !em) return
+  sprayDebugState.activeSpray = spray
+  sprayDebugState.mounted = false
+  sprayDebugState.mountPaths = []
+  sprayDebugState.fsSizes = {}
+  sprayDebugState.error = undefined
+
+  if (!spray) {
+    recordSprayDebug('mount-skipped', { reason: 'no-active-spray' })
+    return
+  }
+  if (!em) {
+    recordSprayDebug('mount-skipped', { reason: 'missing-emscripten-module' })
+    return
+  }
 
   try {
+    recordSprayDebug('fetch-start', {
+      assetId: spray.assetId,
+      wadUrl: spray.wadUrl,
+      expectedBytes: spray.wadSizeBytes,
+      expectedSha256: spray.wadSha256,
+    })
     setLoadProgress('custom_spray', 0.15)
     const response = await fetch(spray.wadUrl, {
       cache: 'force-cache',
@@ -1124,6 +1207,11 @@ async function mountActiveSprayWad(em: Xash3DWebRTC['em']) {
     }
 
     const buffer = await response.arrayBuffer()
+    recordSprayDebug('fetch-complete', {
+      assetId: spray.assetId,
+      status: response.status,
+      bytes: buffer.byteLength,
+    })
     if (buffer.byteLength !== spray.wadSizeBytes) {
       throw new Error(`spray WAD size mismatch (${buffer.byteLength} !== ${spray.wadSizeBytes})`)
     }
@@ -1134,14 +1222,25 @@ async function mountActiveSprayWad(em: Xash3DWebRTC['em']) {
       throw new Error('spray WAD SHA-256 mismatch')
     }
 
-    em.FS.mkdirTree('/rodir/cstrike')
-    em.FS.writeFile('/rodir/cstrike/tempdecal.wad', new Uint8Array(buffer))
+    const fs = em.FS as typeof em.FS & { stat: (path: string) => { size: number } }
+    fs.mkdirTree('/rodir/cstrike')
+    const bytes = new Uint8Array(buffer)
+    SPRAY_WAD_RUNTIME_PATHS.forEach(path => {
+      fs.writeFile(path, bytes)
+      sprayDebugState.mountPaths.push(path)
+      sprayDebugState.fsSizes[path] = fs.stat(path).size
+    })
+    sprayDebugState.mounted = true
     setLoadProgress('custom_spray', 1)
-    console.log('[RuntimeLaunch] mounted active spray', {
+    recordSprayDebug('mount-complete', {
       assetId: spray.assetId,
       sizeBytes: spray.wadSizeBytes,
+      paths: [...sprayDebugState.mountPaths],
+      fsSizes: { ...sprayDebugState.fsSizes },
     })
   } catch (error) {
+    sprayDebugState.error = error instanceof Error ? error.message : String(error)
+    recordSprayDebug('mount-error', { error: sprayDebugState.error })
     console.warn('[RuntimeLaunch] active spray was not mounted', error)
   }
 }
@@ -1578,6 +1677,14 @@ async function main() {
   x.main()
   x.Cmd_ExecuteString('gl_check_errors 0')
   applyCounterSolNativeUiSuppression(x)
+  x.Cmd_ExecuteString('cl_allowupload 1')
+  x.Cmd_ExecuteString('cl_allowdownload 1')
+  x.Cmd_ExecuteString('cl_download_ingame 1')
+  recordSprayDebug('client-cvars-applied', {
+    cl_allowupload: 1,
+    cl_allowdownload: 1,
+    cl_download_ingame: 1,
+  })
   if (window.__CS_CAMERA_ACTIVE) {
     x.Cmd_ExecuteString('con_color "0 0 0"')
     x.Cmd_ExecuteString('con_alpha 0')
