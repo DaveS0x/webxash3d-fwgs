@@ -177,6 +177,14 @@ declare global {
       account?: {
         activeSpray?: RuntimeLaunchSpray
       }
+      wager?: {
+        sessionId?: string
+        userId?: string
+        walletAddress?: string
+        joinToken?: string
+        streamToken?: string
+        liveUrl?: string
+      }
     }
     __CS_SPRAY_DEBUG__?: SprayDebugState
     __CS_START_RUNTIME?: (playerName: string) => boolean
@@ -1103,6 +1111,28 @@ function sanitizePlayerName(raw: string) {
   return raw.trim().slice(0, 24)
 }
 
+function sanitizeUserInfoValue(raw: unknown) {
+  if (typeof raw !== 'string') return ''
+  return raw.replace(/["\\;\n\r]/g, '').trim().slice(0, 192)
+}
+
+function applyWagerUserInfo(x: Xash3DWebRTC) {
+  const wager = window.__CS_RUNTIME_LAUNCH?.wager
+  if (!wager) return
+
+  const pairs = [
+    ['_csw_join', wager.joinToken],
+    ['_csw_session', wager.sessionId],
+    ['_csw_user', wager.userId],
+    ['_csw_wallet', wager.walletAddress],
+  ] as const
+
+  pairs.forEach(([key, rawValue]) => {
+    const value = sanitizeUserInfoValue(rawValue)
+    if (value) x.Cmd_ExecuteString(`setinfo ${key} "${value}"`)
+  })
+}
+
 function hideLegacyLaunchUi() {
   const form     = document.getElementById('form')     as HTMLFormElement | null
   const social   = document.getElementById('social')   as HTMLDivElement | null
@@ -1691,6 +1721,7 @@ async function main() {
   }
   if (touchControls.checked) x.Cmd_ExecuteString('touch_enable 1')
   x.Cmd_ExecuteString(`name "${username}"`)
+  applyWagerUserInfo(x)
 
   if (config.console && Array.isArray(config.console)) {
     config.console.forEach((cmd: string) => { x.Cmd_ExecuteString(cmd) })
