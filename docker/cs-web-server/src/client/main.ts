@@ -173,8 +173,10 @@ declare global {
     crossOriginIsolated?: boolean
     __CS_LOAD_PROGRESS_SET?: (stage: string, percent: number) => void
     __CS_RUNTIME_LAUNCH?: {
+      launchToken?: string
       playerName?: string
       account?: {
+        userId?: string
         activeSpray?: RuntimeLaunchSpray
       }
       wager?: {
@@ -1133,6 +1135,14 @@ function applyWagerUserInfo(x: Xash3DWebRTC) {
   })
 }
 
+function applyVoteKickAuthUserInfo(x: Xash3DWebRTC) {
+  const launch = window.__CS_RUNTIME_LAUNCH
+  if (!launch?.account?.userId) return
+
+  const launchToken = sanitizeUserInfoValue(launch.launchToken)
+  if (launchToken) x.Cmd_ExecuteString(`setinfo _csvote_launch "${launchToken}"`)
+}
+
 function hideLegacyLaunchUi() {
   const form     = document.getElementById('form')     as HTMLFormElement | null
   const social   = document.getElementById('social')   as HTMLDivElement | null
@@ -1721,6 +1731,7 @@ async function main() {
   }
   if (touchControls.checked) x.Cmd_ExecuteString('touch_enable 1')
   x.Cmd_ExecuteString(`name "${username}"`)
+  applyVoteKickAuthUserInfo(x)
   applyWagerUserInfo(x)
 
   if (config.console && Array.isArray(config.console)) {
