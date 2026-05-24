@@ -117,6 +117,9 @@ type PointerLockGuardSnapshot = {
   lastRequestSource?: string
   lastBlockReason?: string
   lastTrustedCanvasGestureMs?: number
+  unadjustedMovement: 'enabled' | 'unsupported' | 'unknown'
+  lastForcedExitReason?: string
+  lastForcedExitMs?: number
 }
 
 type PointerLockRequestElement = Element & {
@@ -326,6 +329,9 @@ const pointerLockGuardState: PointerLockGuardSnapshot = {
   blockedRequests: 0,
   forcedExits: 0,
   trustedCanvasGestures: 0,
+  unadjustedMovement: 'unknown',
+  lastForcedExitReason: undefined,
+  lastForcedExitMs: undefined,
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +737,8 @@ function noteAllowedPointerLockRequest(source: string, target: Element) {
 function forceExitUnexpectedPointerLock(source: string) {
   if (!document.pointerLockElement) return
   pointerLockGuardState.forcedExits++
+  pointerLockGuardState.lastForcedExitReason = source
+  pointerLockGuardState.lastForcedExitMs = performance.now()
   releaseExclusiveBrowserModes(source, false)
   markPointerLockNeedsFreshGesture()
 }
@@ -738,6 +746,11 @@ function forceExitUnexpectedPointerLock(source: string) {
 function releaseUnexpectedPointerLockIfNeeded(source: string) {
   if (!document.pointerLockElement) return
   if (!pointerLockNeedsFreshCanvasGesture || hasRecentPointerLockUserGesture()) return
+  // Once the user has successfully engaged pointer lock in this session, trust
+  // subsequent transient lock events (browser-internal re-engage after Esc,
+  // focus/visibility races during the startup window). The wrapper still blocks
+  // initial untrusted requests via shouldAllowPointerLockRequest.
+  if (pointerLockWasActive) return
   forceExitUnexpectedPointerLock(source)
 }
 
@@ -767,8 +780,25 @@ function installPointerLockReentryGuard() {
           return Promise.resolve()
         }
         noteAllowedPointerLockRequest('requestPointerLock', this)
-        const result = originalRequestPointerLock.call(this, options)
-        return result ?? Promise.resolve()
+        // Request unadjusted (raw) mouse deltas so the engine receives 1:1 motion
+        // without OS-level acceleration/DPI scaling. Falls back if the platform
+        // can't honor the option (Chrome rejects with NotSupportedError).
+        const withUnadjusted: PointerLockOptions = { ...(options ?? {}), unadjustedMovement: true }
+        const result = originalRequestPointerLock.call(this, withUnadjusted)
+        if (result && typeof (result as Promise<void>).then === 'function') {
+          return (result as Promise<void>).then(
+            () => { pointerLockGuardState.unadjustedMovement = 'enabled' },
+            (err: unknown) => {
+              const name = err instanceof Error ? err.name : ''
+              if (name !== 'NotSupportedError') throw err
+              pointerLockGuardState.unadjustedMovement = 'unsupported'
+              const fallback = originalRequestPointerLock.call(this, options)
+              return fallback ?? Promise.resolve()
+            },
+          )
+        }
+        pointerLockGuardState.unadjustedMovement = 'unknown'
+        return Promise.resolve()
       },
     })
   }
@@ -800,7 +830,13 @@ function releaseExclusiveBrowserModesOnHidden() {
 
 function handlePointerLockChange() {
   if (document.pointerLockElement) {
-    if (pointerLockNeedsFreshCanvasGesture && !hasRecentPointerLockUserGesture()) {
+    // Only force-exit "untrusted" lock acquisitions BEFORE the user has ever
+    // engaged lock this session. After the first trusted lock, browser-internal
+    // re-engage (e.g. brief flap around Esc) or non-wrapper acquisition paths
+    // are accepted — otherwise the guard fires on legitimate mid-play events.
+    if (!pointerLockWasActive
+        && pointerLockNeedsFreshCanvasGesture
+        && !hasRecentPointerLockUserGesture()) {
       forceExitUnexpectedPointerLock('pointerlockchange-untrusted-lock')
       return
     }
@@ -1729,7 +1765,7 @@ async function main() {
     x.Cmd_ExecuteString('con_color "0 0 0"')
     x.Cmd_ExecuteString('con_alpha 0')
   }
-  if (touchControls.checked) x.Cmd_ExecuteString('touch_enable 1')
+  x.Cmd_ExecuteString(`touch_enable ${touchControls.checked ? 1 : 0}`)
   x.Cmd_ExecuteString(`name "${username}"`)
   applyVoteKickAuthUserInfo(x)
   applyWagerUserInfo(x)
