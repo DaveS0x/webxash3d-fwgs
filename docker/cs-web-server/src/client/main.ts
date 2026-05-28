@@ -144,6 +144,17 @@ type RuntimeLaunchSpray = {
   textureName?: unknown
 }
 
+type RuntimeGameSettings = {
+  schemaVersion?: unknown
+  resolution?: unknown
+  mouseSensitivity?: unknown
+  soundVolume?: unknown
+  brightness?: unknown
+  screenWidth?: unknown
+  invertedMouse?: unknown
+  viewmodelHand?: unknown
+}
+
 type ActiveRuntimeSpray = {
   assetId: string
   wadUrl: string
@@ -178,6 +189,7 @@ declare global {
     __CS_RUNTIME_LAUNCH?: {
       launchToken?: string
       playerName?: string
+      gameSettings?: RuntimeGameSettings
       account?: {
         userId?: string
         activeSpray?: RuntimeLaunchSpray
@@ -1154,6 +1166,83 @@ function sanitizeUserInfoValue(raw: unknown) {
   return raw.replace(/["\\;\n\r]/g, '').trim().slice(0, 192)
 }
 
+function clampRuntimeNumber(raw: unknown, fallback: number, min: number, max: number) {
+  const value = typeof raw === 'number' ? raw : Number(raw)
+  if (!Number.isFinite(value)) return fallback
+  return Math.max(min, Math.min(max, value))
+}
+
+function formatRuntimeNumber(value: number) {
+  return Number(value.toFixed(4)).toString()
+}
+
+function getLaunchGameSettings() {
+  return window.__CS_RUNTIME_LAUNCH?.gameSettings
+}
+
+function parseResolutionPreset(raw: unknown) {
+  if (typeof raw !== 'string' || raw === 'default') return null
+  const match = /^(\d{3,4})x(\d{3,4})$/.exec(raw)
+  if (!match) return null
+  const width = Number(match[1])
+  const height = Number(match[2])
+  if (!Number.isInteger(width) || !Number.isInteger(height)) return null
+  if (width < 640 || width > 3840 || height < 480 || height > 2160) return null
+  return { width, height }
+}
+
+function buildRuntimeArguments(baseArgs: string[]) {
+  const resolution = parseResolutionPreset(getLaunchGameSettings()?.resolution)
+  if (!resolution) return baseArgs
+
+  const argsWithoutResolution: string[] = []
+  for (let index = 0; index < baseArgs.length; index += 1) {
+    const arg = baseArgs[index]
+    if (arg === '-width' || arg === '-height') {
+      index += 1
+      continue
+    }
+    argsWithoutResolution.push(arg)
+  }
+
+  return [
+    ...argsWithoutResolution,
+    '-width',
+    String(resolution.width),
+    '-height',
+    String(resolution.height),
+  ]
+}
+
+function applyRuntimeGameSettings(x: Xash3DWebRTC) {
+  const settings = getLaunchGameSettings()
+  const commands = [
+    'm_rawinput 1',
+    'm_customaccel 0',
+    'hud_fastswitch 1',
+  ]
+
+  if (settings) {
+    const mouseSensitivity = clampRuntimeNumber(settings.mouseSensitivity, 3, 0.1, 20)
+    const soundVolume = clampRuntimeNumber(settings.soundVolume, 0.7, 0, 1)
+    const brightness = clampRuntimeNumber(settings.brightness, 0, 0, 3)
+    const screenWidth = Math.round(clampRuntimeNumber(settings.screenWidth, 100, 80, 120))
+    const invertedMouse = settings.invertedMouse === true
+    const viewmodelHand = settings.viewmodelHand === 'left' ? 0 : 1
+
+    commands.push(
+      `sensitivity ${formatRuntimeNumber(mouseSensitivity)}`,
+      `volume ${formatRuntimeNumber(soundVolume)}`,
+      `brightness ${formatRuntimeNumber(brightness)}`,
+      `viewsize ${screenWidth}`,
+      `m_pitch ${invertedMouse ? '-0.022' : '0.022'}`,
+      `cl_righthand ${viewmodelHand}`,
+    )
+  }
+
+  commands.forEach((command) => x.Cmd_ExecuteString(command))
+}
+
 function applyWagerUserInfo(x: Xash3DWebRTC) {
   const wager = window.__CS_RUNTIME_LAUNCH?.wager
   if (!wager) return
@@ -1675,7 +1764,7 @@ async function main() {
 
   const runtimeOptions = {
     canvas: document.getElementById('canvas') as HTMLCanvasElement,
-    arguments: config.arguments || ['-windowed'],
+    arguments: buildRuntimeArguments(config.arguments || ['-windowed']),
     libraries: {
       filesystem: config.libraries.filesystem,
       xash: xashURL,
@@ -1747,8 +1836,9 @@ async function main() {
   installRuntimeGlobals(x)
   // Restore HUD bridge compatibility: new Emscripten no longer sets globalThis.LDSO.
   // The em object now exposes it; expose it globally before the main loop starts.
-  if (x.em && !globalThis.LDSO) {
-    (globalThis as unknown as Record<string, unknown>).LDSO = (x.em as unknown as Record<string, unknown>).LDSO
+  const globalRecord = globalThis as unknown as Record<string, unknown>
+  if (x.em && !globalRecord.LDSO) {
+    globalRecord.LDSO = (x.em as unknown as Record<string, unknown>).LDSO
   }
   x.main()
   x.Cmd_ExecuteString('gl_check_errors 0')
@@ -1773,6 +1863,7 @@ async function main() {
   if (config.console && Array.isArray(config.console)) {
     config.console.forEach((cmd: string) => { x.Cmd_ExecuteString(cmd) })
   }
+  applyRuntimeGameSettings(x)
 
   setLoadProgress('connecting', 1)
   x.Cmd_ExecuteString('connect 127.0.0.1:8080')
