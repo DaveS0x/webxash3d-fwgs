@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "xash3d-fwgs": ["src/client/test-support/xash3d-fwgs.ts"]
+    }
+  }
+}

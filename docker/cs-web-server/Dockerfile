@@ -15,6 +15,11 @@ RUN ./waf configure -T release -d --enable-openmp && ./waf build
 
 FROM golang:1.25.1 AS go
 
+RUN dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gcc-multilib g++-multilib libbsd-dev:i386 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /go
 COPY docker/cs-web-server/go.mod go.mod
 COPY docker/cs-web-server/go.sum go.sum
@@ -31,6 +36,7 @@ COPY --from=engine /xash/build/3rdparty/libbacktrace/libbacktrace.a ../github.co
 COPY --from=engine /xash/build/3rdparty/library_suffix/liblibrary_suffix.a ../github.com/yohimik/goxash3d-fwgs/pkg/liblibrary_suffix.a
 
 ENV GOARCH=386
+ENV CGO_ENABLED=1
 ENV CC="gcc -m32 -D__i386__"
 ENV CGO_CFLAGS="-fopenmp -m32 -fno-ipa-cp"
 ENV CGO_LDFLAGS="-fopenmp -m32"

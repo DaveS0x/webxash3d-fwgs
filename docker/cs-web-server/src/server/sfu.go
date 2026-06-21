@@ -12,7 +12,9 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/yohimik/goxash3d-fwgs/pkg"
+	"github.com/yohimik/webxash3d-fwgs/docker/cs-web-server/src/server/signaling"
 	"io"
+	stdlog "log"
 	"math/rand"
 	"net/http"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,12 +90,13 @@ type websocketMessage struct {
 }
 
 type peerConnectionState struct {
+	id             string
 	peerConnection *webrtc.PeerConnection
 	websocket      *threadSafeWriter
-	signalsCount   int
+	negotiation    signaling.State
 }
 
-const DefaultSignalsCount = 5
+var peerConnectionSequence uint64
 
 // Add to list of tracks and fire renegotation for all PeerConnections.
 func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP { // nolint
@@ -111,7 +115,7 @@ func addTrack(t *webrtc.TrackRemote) *webrtc.TrackLocalStaticRTP { // nolint
 	trackLocals[t.ID()] = trackLocal
 
 	for _, con := range peerConnections {
-		con.signalsCount = DefaultSignalsCount
+		con.negotiation.Request()
 	}
 
 	return trackLocal
@@ -126,100 +130,89 @@ func removeTrack(t *webrtc.TrackLocalStaticRTP) {
 	}()
 
 	for _, con := range peerConnections {
-		con.signalsCount = DefaultSignalsCount
+		con.negotiation.Request()
 	}
 
 	delete(trackLocals, t.ID())
 }
 
-// signalPeerConnections updates each PeerConnection so that it is getting all the expected media tracks.
+func syncPeerTracks(state *peerConnectionState) error {
+	existingSenders := map[string]bool{}
+
+	for _, sender := range state.peerConnection.GetSenders() {
+		if sender.Track() == nil {
+			continue
+		}
+
+		existingSenders[sender.Track().ID()] = true
+		if _, ok := trackLocals[sender.Track().ID()]; !ok {
+			if err := state.peerConnection.RemoveTrack(sender); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, receiver := range state.peerConnection.GetReceivers() {
+		if receiver.Track() != nil {
+			existingSenders[receiver.Track().ID()] = true
+		}
+	}
+
+	for trackID := range trackLocals {
+		if _, ok := existingSenders[trackID]; ok {
+			continue
+		}
+		if _, err := state.peerConnection.AddTrack(trackLocals[trackID]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// signalPeerConnections emits at most one outstanding offer per peer. A track
+// change during that offer records one follow-up negotiation after its answer.
 func signalPeerConnections() { // nolint
 	listLock.Lock()
-	defer func() {
-		listLock.Unlock()
-		dispatchKeyFrame()
-	}()
 
-	attemptSync := func() (tryAgain bool) {
-		for i := range peerConnections {
-			if peerConnections[i].signalsCount <= 0 {
-				continue
-			}
+	for index := 0; index < len(peerConnections); {
+		state := peerConnections[index]
+		if state.peerConnection.ConnectionState() == webrtc.PeerConnectionStateClosed {
+			peerConnections = append(peerConnections[:index], peerConnections[index+1:]...)
+			continue
+		}
+		index++
 
-			if peerConnections[i].peerConnection.ConnectionState() == webrtc.PeerConnectionStateClosed {
-				peerConnections = append(peerConnections[:i], peerConnections[i+1:]...)
-
-				return true // We modified the slice, start from the beginning
-			}
-
-			// map of sender we already are seanding, so we don't double send
-			existingSenders := map[string]bool{}
-
-			for _, sender := range peerConnections[i].peerConnection.GetSenders() {
-				if sender.Track() == nil {
-					continue
-				}
-
-				existingSenders[sender.Track().ID()] = true
-
-				// If we have a RTPSender that doesn't map to a existing track remove and signal
-				if _, ok := trackLocals[sender.Track().ID()]; !ok {
-					if err := peerConnections[i].peerConnection.RemoveTrack(sender); err != nil {
-						return true
-					}
-				}
-			}
-
-			// Don't receive videos we are sending, make sure we don't have loopback
-			for _, receiver := range peerConnections[i].peerConnection.GetReceivers() {
-				if receiver.Track() == nil {
-					continue
-				}
-
-				existingSenders[receiver.Track().ID()] = true
-			}
-
-			// Add all track we aren't sending yet to the PeerConnection
-			for trackID := range trackLocals {
-				if _, ok := existingSenders[trackID]; !ok {
-					if _, err := peerConnections[i].peerConnection.AddTrack(trackLocals[trackID]); err != nil {
-						return true
-					}
-				}
-			}
-
-			offer, err := peerConnections[i].peerConnection.CreateOffer(nil)
-			if err != nil {
-				return true
-			}
-
-			if err = peerConnections[i].peerConnection.SetLocalDescription(offer); err != nil {
-				return true
-			}
-
-			if err = peerConnections[i].websocket.WriteJSON("offer", offer); err != nil {
-				return true
-			}
+		if !state.negotiation.BeginOffer() {
+			continue
+		}
+		if err := syncPeerTracks(state); err != nil {
+			state.negotiation.FailOffer()
+			log.Errorf("[%s] failed to synchronize tracks: %v", state.id, err)
+			continue
 		}
 
-		return tryAgain
+		offer, err := state.peerConnection.CreateOffer(nil)
+		if err != nil {
+			state.negotiation.FailOffer()
+			log.Errorf("[%s] failed to create offer: %v", state.id, err)
+			continue
+		}
+		if err = state.peerConnection.SetLocalDescription(offer); err != nil {
+			state.negotiation.FailOffer()
+			log.Errorf("[%s] failed to set local description: %v", state.id, err)
+			continue
+		}
+		if err = state.websocket.WriteJSON("offer", offer); err != nil {
+			state.negotiation.FailOffer()
+			log.Errorf("[%s] failed to send offer: %v", state.id, err)
+			continue
+		}
+		stdlog.Printf("[sfu-ws] [%s] offer sent", state.id)
 	}
 
-	for syncAttempt := 0; ; syncAttempt++ {
-		if syncAttempt == 25 {
-			// Release the lock and attempt a sync in 3 seconds. We might be blocking a RemoveTrack or AddTrack
-			go func() {
-				time.Sleep(time.Second * 3)
-				signalPeerConnections()
-			}()
-
-			return
-		}
-
-		if !attemptSync() {
-			break
-		}
-	}
+	listLock.Unlock()
+	dispatchKeyFrame()
 }
 
 // dispatchKeyFrame sends a keyframe to all PeerConnections, used everytime a new user joins the call.
@@ -285,9 +278,29 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 
 		return
 	}
+	state := &peerConnectionState{
+		id:             fmt.Sprintf("pc-%d", atomic.AddUint64(&peerConnectionSequence, 1)),
+		peerConnection: peerConnection,
+		websocket:      c,
+		negotiation:    signaling.NewState(),
+	}
+	stdlog.Printf("[sfu-ws] [%s] websocket accepted", state.id)
 
 	// When this frame returns close the PeerConnection
-	defer peerConnection.Close() //nolint
+	defer func() {
+		listLock.Lock()
+		for index, candidate := range peerConnections {
+			if candidate == state {
+				peerConnections = append(peerConnections[:index], peerConnections[index+1:]...)
+				break
+			}
+		}
+		listLock.Unlock()
+		if closeErr := peerConnection.Close(); closeErr != nil {
+			log.Errorf("[%s] failed to close PeerConnection: %v", state.id, closeErr)
+		}
+		stdlog.Printf("[sfu-ws] [%s] connection torn down", state.id)
+	}()
 
 	// Accept one audio track incoming
 	for _, typ := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeAudio} {
@@ -313,7 +326,10 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 	}
 	index, _ := pool.TryGet()
 	ip[0] = index
-	defer pool.TryPut(index)
+	defer func() {
+		connections[index] = nil
+		pool.TryPut(index)
+	}()
 
 	writeChannel, err := peerConnection.CreateDataChannel("write", &webrtc.DataChannelInit{
 		Ordered:        &f,
@@ -331,9 +347,11 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 		}
 	}()
 	writeChannel.OnOpen(func() {
+		stdlog.Printf("[sfu-ws] [%s] data channel open label=write", state.id)
 		d, err := writeChannel.Detach()
 		if err != nil {
-			panic(err)
+			log.Errorf("[%s] failed to detach write channel: %v", state.id, err)
+			return
 		}
 		connections[index] = d
 
@@ -348,9 +366,11 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 		}
 		readChannel = rc
 		readChannel.OnOpen(func() {
+			stdlog.Printf("[sfu-ws] [%s] data channel open label=read", state.id)
 			d, err := readChannel.Detach()
 			if err != nil {
-				panic(err)
+				log.Errorf("[%s] failed to detach read channel: %v", state.id, err)
+				return
 			}
 			go ReadLoop(d, ip)
 		})
@@ -360,25 +380,37 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 	// Trickle ICE. Emit server candidate to client
 	peerConnection.OnICECandidate(func(i *webrtc.ICECandidate) {
 		if i == nil {
+			stdlog.Printf("[sfu-ws] [%s] ICE gathering complete", state.id)
 			return
 		}
-		// If you are serializing a candidate make sure to use ToJSON
-		// Using Marshal will result in errors around `sdpMid`
-
-		if writeErr := c.WriteJSON("candidate", i.ToJSON()); writeErr != nil {
-			log.Errorf("Failed to write JSON: %v", writeErr)
+		candidate := i.ToJSON()
+		candidateType := "unknown"
+		fields := strings.Fields(candidate.Candidate)
+		for fieldIndex := 0; fieldIndex+1 < len(fields); fieldIndex++ {
+			if fields[fieldIndex] == "typ" {
+				candidateType = fields[fieldIndex+1]
+				break
+			}
+		}
+		stdlog.Printf("[sfu-ws] [%s] local ICE candidate type=%s", state.id, candidateType)
+		if writeErr := c.WriteJSON("candidate", candidate); writeErr != nil {
+			log.Errorf("[%s] failed to write ICE candidate: %v", state.id, writeErr)
 		}
 	})
 
-	// If PeerConnection is closed remove it from global list
+	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
+		stdlog.Printf("[sfu-ws] [%s] ICE state=%s", state.id, connectionState.String())
+	})
+	peerConnection.OnSignalingStateChange(func(signalingState webrtc.SignalingState) {
+		stdlog.Printf("[sfu-ws] [%s] signaling state=%s", state.id, signalingState.String())
+	})
 	peerConnection.OnConnectionStateChange(func(p webrtc.PeerConnectionState) {
+		stdlog.Printf("[sfu-ws] [%s] peer state=%s", state.id, p.String())
 		switch p {
 		case webrtc.PeerConnectionStateFailed:
 			if err := peerConnection.Close(); err != nil {
-				log.Errorf("Failed to close PeerConnection: %v", err)
+				log.Errorf("[%s] failed to close PeerConnection: %v", state.id, err)
 			}
-		case webrtc.PeerConnectionStateClosed:
-			signalPeerConnections()
 		default:
 		}
 	})
@@ -412,10 +444,9 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 		}
 	})
 
-	// Add our new PeerConnection to global list
-	state := peerConnectionState{peerConnection, c, DefaultSignalsCount}
+	// Add our new PeerConnection to global list.
 	listLock.Lock()
-	peerConnections = append(peerConnections, &state)
+	peerConnections = append(peerConnections, state)
 	listLock.Unlock()
 
 	// Signal for the new PeerConnection
@@ -440,38 +471,45 @@ func websocketHandler(w http.ResponseWriter, r *http.Request) { // nolint
 		case "candidate":
 			candidate := webrtc.ICECandidateInit{}
 			if err := json.Unmarshal(message.Data, &candidate); err != nil {
-				log.Errorf("Failed to unmarshal json to candidate: %v", err)
+				log.Errorf("[%s] failed to unmarshal ICE candidate: %v", state.id, err)
 
 				return
 			}
 
 			if err := peerConnection.AddICECandidate(candidate); err != nil {
-				log.Errorf("Failed to add ICE candidate: %v", err)
+				log.Errorf("[%s] failed to add ICE candidate: %v", state.id, err)
 
 				return
 			}
+			stdlog.Printf("[sfu-ws] [%s] remote ICE candidate applied", state.id)
 		case "answer":
 			answer := webrtc.SessionDescription{}
 			if err := json.Unmarshal(message.Data, &answer); err != nil {
-				log.Errorf("Failed to unmarshal json to answer: %v", err)
+				log.Errorf("[%s] failed to unmarshal answer: %v", state.id, err)
 
 				return
 			}
 
 			if err := peerConnection.SetRemoteDescription(answer); err != nil {
-				log.Errorf("Failed to set remote description: %v", err)
+				log.Errorf("[%s] failed to set remote description: %v", state.id, err)
 
 				return
 			}
 			listLock.Lock()
-			state.signalsCount -= 1
-			isNeedSignaling := state.signalsCount > 0
+			offerWasPending := state.negotiation.OfferPending()
+			needsFollowUp := state.negotiation.AcceptAnswer()
 			listLock.Unlock()
-			if isNeedSignaling {
-				signalPeerConnections()
+			stdlog.Printf(
+				"[sfu-ws] [%s] answer accepted offerPending=%t followUp=%t",
+				state.id,
+				offerWasPending,
+				needsFollowUp,
+			)
+			if needsFollowUp {
+				go signalPeerConnections()
 			}
 		default:
-			log.Errorf("unknown message: %+v", message)
+			log.Errorf("[%s] unknown message: %+v", state.id, message)
 		}
 	}
 }

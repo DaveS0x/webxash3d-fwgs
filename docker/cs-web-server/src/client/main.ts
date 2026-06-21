@@ -128,6 +128,7 @@ type PointerLockRequestElement = Element & {
 }
 
 type XashModuleCallbacks = {
+  gameReady?: () => void
   nativeStallFrameBegin?: () => void
   nativeStallTrace?: (line: string) => void
   nativeStallFs?: (event: NativeStallFsEvent) => void
@@ -205,6 +206,7 @@ declare global {
     }
     __CS_SPRAY_DEBUG__?: SprayDebugState
     __CS_START_RUNTIME?: (playerName: string) => boolean
+    __CS_RUNTIME_BOOT_FAILED?: (message: string) => void
     __CS_AUDIO_CONTEXT_HINTS?: boolean | string | number
     __CS_AUDIO_CONTEXT_SAMPLE_RATE?: number | string
     __CS_AUDIO_CONTEXT_LATENCY_HINT?: AudioContextOptions['latencyHint'] | string
@@ -1779,6 +1781,48 @@ function runtimeModuleCdnUrls(): Partial<Record<RuntimeModuleRole, string>> {
   return out
 }
 
+function withBootTimeout<T>(promise: Promise<T>, label: string, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error(`${label} did not complete within ${timeoutMs}ms`))
+    }, timeoutMs)
+    promise.then(
+      value => {
+        window.clearTimeout(timer)
+        resolve(value)
+      },
+      error => {
+        window.clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
+function installGameReadyGate(moduleRef: NonNullable<Window['Module']>) {
+  let fired = false
+  let resolveReady!: () => void
+  const ready = new Promise<void>(resolve => {
+    resolveReady = resolve
+  })
+  const callbacks = (moduleRef.callbacks ??= {})
+  const previousGameReady = callbacks.gameReady
+  callbacks.gameReady = () => {
+    previousGameReady?.()
+    if (fired) return
+    fired = true
+    console.info('[RuntimeBoot] engine gameReady')
+    resolveReady()
+  }
+  return ready
+}
+
+function reportRuntimeBootFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  console.error('[RuntimeBoot] fatal', error)
+  window.__CS_RUNTIME_BOOT_FAILED?.(`Client startup failed: ${message}`)
+}
+
 async function main() {
   const config = await fetch('/config').then(res => res.json()) as Awaited<{
     arguments: string[];
@@ -1797,6 +1841,8 @@ async function main() {
 
   const username = await usernamePromise
   installModuleLogProgressHooks()
+  const moduleRef = (window.Module ??= {})
+  const gameReadyPromise = installGameReadyGate(moduleRef)
 
   // Prefer CDN URLs for the WASM engine modules when the manifest published
   // them; otherwise fall back to the same-origin /config + Vite-bundled paths.
@@ -1817,12 +1863,21 @@ async function main() {
     },
     dynamicLibraries: config.dynamic_libraries,
     filesMap: config.files_map,
-    module: (window.Module ??= {}),
+    module: moduleRef,
   } as ConstructorParameters<typeof Xash3DWebRTC>[0]
 
   const x = new Xash3DWebRTC(runtimeOptions)
 
-  const initPromise = x.init()
+  // Engine setup and transport negotiation are independent. Starting both now
+  // avoids the old circular wait where x.main() was held behind WebRTC while
+  // onRuntimeInitialized could only fire after x.main().
+  const engineInitPromise = withBootTimeout(x.init(), 'Engine initialization', 25_000)
+  const transportPromise = x.connect()
+  // Attach a rejection handler immediately; the same promise is awaited after
+  // assets are mounted, but a quick ICE failure must not become "unhandled".
+  void transportPromise.catch(() => {})
+  setLoadProgress('initializing', 0.35)
+
   const [zip, extras] = await Promise.all([
     (async () => {
       const res = await fetchWithProgress(`valve.zip?v=${RUNTIME_ASSET_VERSION}`)
@@ -1832,10 +1887,9 @@ async function main() {
       const res = await fetch(config.libraries.extras)
       return await res.arrayBuffer()
     })(),
+    engineInitPromise,
   ])
 
-  setLoadProgress('initializing', 0.35)
-  await initPromise
   setLoadProgress('initializing', 1)
 
   const em = x.em
@@ -1881,6 +1935,14 @@ async function main() {
     globalRecord.LDSO = (x.em as unknown as Record<string, unknown>).LDSO
   }
   x.main()
+
+  setLoadProgress('connecting', 0.5)
+  await Promise.all([
+    withBootTimeout(gameReadyPromise, 'Engine gameReady', 20_000),
+    transportPromise,
+  ])
+
+  // The command pool and both WebRTC data channels are now ready.
   x.Cmd_ExecuteString('gl_check_errors 0')
   applyCounterSolNativeUiSuppression(x)
   x.Cmd_ExecuteString('cl_allowupload 1')
@@ -1949,4 +2011,4 @@ if (username) {
   beginRuntimeLaunch(submitted)
 })
 
-main()
+void main().catch(reportRuntimeBootFailure)
