@@ -1743,6 +1743,42 @@ async function fetchWithProgress(url: string) {
   return blob.arrayBuffer()
 }
 
+// Roles carried by the asset manifest's runtime (WASM engine) packs, tagged
+// `role:<x>`. Mirrors RUNTIME_MODULE_PACKS in the control-plane seed data.
+const RUNTIME_MODULE_ROLES = ['client', 'server', 'menu', 'filesystem', 'xash', 'gl4es'] as const
+type RuntimeModuleRole = (typeof RUNTIME_MODULE_ROLES)[number]
+
+// Map each engine module to the content-addressed CDN URL the control plane
+// published for it (kind:'runtime' packs in window.__CS_RUNTIME_ASSET_MANIFEST,
+// installed by index.patched.html before the runtime starts). This moves the
+// ~2.5 MB of WASM off the slow same-origin proxy on cold loads. Unpublished
+// modules are dropped from the manifest upstream, so they are simply absent
+// here and the caller keeps its same-origin default.
+function runtimeModuleCdnUrls(): Partial<Record<RuntimeModuleRole, string>> {
+  const out: Partial<Record<RuntimeModuleRole, string>> = {}
+  try {
+    const manifest = (window as unknown as {
+      __CS_RUNTIME_ASSET_MANIFEST?: { packs?: Array<{ kind?: string; url?: string; tags?: string[] }> }
+    }).__CS_RUNTIME_ASSET_MANIFEST
+    const packs = manifest?.packs
+    if (!Array.isArray(packs)) return out
+    for (const pack of packs) {
+      if (!pack || pack.kind !== 'runtime' || typeof pack.url !== 'string') continue
+      const roleTag = (pack.tags ?? []).find((t) => typeof t === 'string' && t.startsWith('role:'))
+      const role = roleTag?.slice('role:'.length) as RuntimeModuleRole | undefined
+      if (!role || !RUNTIME_MODULE_ROLES.includes(role)) continue
+      // Belt-and-suspenders: only accept an absolute, cross-origin CDN URL.
+      try {
+        const u = new URL(pack.url)
+        if ((u.protocol === 'https:' || u.protocol === 'http:') && u.origin !== window.location.origin) {
+          out[role] = pack.url
+        }
+      } catch { /* ignore malformed url */ }
+    }
+  } catch { /* manifest not ready / unexpected shape → no CDN overrides */ }
+  return out
+}
+
 async function main() {
   const config = await fetch('/config').then(res => res.json()) as Awaited<{
     arguments: string[];
@@ -1762,17 +1798,21 @@ async function main() {
   const username = await usernamePromise
   installModuleLogProgressHooks()
 
+  // Prefer CDN URLs for the WASM engine modules when the manifest published
+  // them; otherwise fall back to the same-origin /config + Vite-bundled paths.
+  const cdn = runtimeModuleCdnUrls()
+
   const runtimeOptions = {
     canvas: document.getElementById('canvas') as HTMLCanvasElement,
     arguments: buildRuntimeArguments(config.arguments || ['-windowed']),
     libraries: {
-      filesystem: config.libraries.filesystem,
-      xash: xashURL,
-      menu: config.libraries.menu,
-      server: config.libraries.server,
-      client: withAssetVersion(config.libraries.client),
+      filesystem: cdn.filesystem ?? config.libraries.filesystem,
+      xash: cdn.xash ?? xashURL,
+      menu: cdn.menu ?? config.libraries.menu,
+      server: cdn.server ?? config.libraries.server,
+      client: cdn.client ?? withAssetVersion(config.libraries.client),
       render: {
-        gl4es: gl4esURL,
+        gl4es: cdn.gl4es ?? gl4esURL,
       }
     },
     dynamicLibraries: config.dynamic_libraries,
