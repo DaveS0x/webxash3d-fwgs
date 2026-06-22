@@ -33,6 +33,18 @@ declare type DNS = {
   lookup_addr(addr: string): string | null;
 };
 
+declare type LDSOLibrary = {
+    refcount: number
+    name: string
+    exports: Record<string, unknown>
+    global: boolean
+}
+
+declare type LDSO = {
+    loadedLibsByName: Record<string, LDSOLibrary>
+    loadedLibsByHandle: Record<number, LDSOLibrary>
+}
+
 export type ModuleCallbacks = {
     gameReady?: () => void
     syncFS?: (data: {path: string, op: string}) => void
@@ -65,6 +77,7 @@ export type Em = {
     FS: FS,
     SOCKFS: SOCKFS,
     DNS: DNS,
+    LDSO: LDSO,
     start: () => void
     HEAPU32: Int8Array
     HEAP32: Int8Array

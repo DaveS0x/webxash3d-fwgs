@@ -43,6 +43,7 @@ async function main() {
             FS,
             SOCKFS,
             DNS,
+            LDSO,
             HEAPU32,
             HEAP32,
             HEAP16,
