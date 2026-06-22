@@ -9,7 +9,7 @@
     "build-docker": "TAG=$(node -p \"require('./package.json').version\") docker compose build",
     "push-image": "TAG=$(node -p \"require('./package.json').version\") docker compose push",
     "serve": "vite preview",
-    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import tsx src/client/webrtc.test.ts"
+    "test": "TSX_TSCONFIG_PATH=tsconfig.test.json node --import tsx --test src/client/webrtc.test.ts src/client/audio-bridge.test.ts"
   },
   "author": "",
   "license": "ISC",

@@ -1,6 +1,7 @@
 import { loadAsync } from 'jszip'
 import xashURL from 'xash3d-fwgs/xash.wasm?url'
 import gl4esURL from 'xash3d-fwgs/libref_webgl2.wasm?url'
+import { createWorkletBackedScriptProcessorNode } from './audio-bridge'
 import { Xash3DWebRTC } from './webrtc'
 
 type AudioContextConstructor = {
@@ -44,6 +45,9 @@ type AudioBackendSnapshot = {
   crossOriginIsolated: boolean
   workletBridgeEnabled: boolean
   workletBridgeInstalled: boolean
+  workletBridgeFailed: boolean
+  workletBridgeStatus: 'disabled' | 'pending' | 'installed' | 'fallback'
+  workletFallbacks: number
   sdlCallbackCount: number
   ringOverflowDrops: number
   workletUnderruns: number
@@ -253,7 +257,7 @@ declare global {
 
 const buildEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}
 const RUNTIME_ASSET_VERSION = buildEnv.VITE_CS_RUNTIME_ASSET_VERSION ?? '20260427soundbuf1'
-const AUDIO_BACKEND_VARIANT = 'aw-bridge-20260428a'
+const AUDIO_BACKEND_VARIANT = 'aw-bridge-20260622a'
 const SPRAY_WAD_RUNTIME_PATHS = [
   '/rodir/cstrike/countersol_tempdecal.wad',
   '/rodir/cstrike/tempdecal.wad',
@@ -318,6 +322,9 @@ const audioBackendState: Omit<
   suspendFailures: 0,
   workletBridgeEnabled: false,
   workletBridgeInstalled: false,
+  workletBridgeFailed: false,
+  workletBridgeStatus: 'disabled',
+  workletFallbacks: 0,
   sdlCallbackCount: 0,
   ringOverflowDrops: 0,
   workletUnderruns: 0,
@@ -410,17 +417,25 @@ registerProcessor('cs-audio', CSAudioProcessor)
 // Worklet bridge setup — called as soon as an AudioContext is instrumented
 // ---------------------------------------------------------------------------
 
-function setupWorkletBridge(ctx: AudioContext): void {
-  if (typeof SharedArrayBuffer === 'undefined') {
-    audioBackendState.lastError = 'SharedArrayBuffer unavailable — COOP/COEP headers not active'
-    return
+function workletBridgeUnavailableReason(ctx: AudioContext): string | undefined {
+  if (window.crossOriginIsolated !== true) {
+    return 'Cross-origin isolation unavailable — COOP/COEP headers not active'
   }
+  if (typeof SharedArrayBuffer === 'undefined') return 'SharedArrayBuffer unavailable'
+  if (!ctx.audioWorklet || typeof ctx.audioWorklet.addModule !== 'function') {
+    return 'AudioWorklet.addModule unavailable'
+  }
+  if (typeof AudioWorkletNode === 'undefined') return 'AudioWorkletNode unavailable'
+  return undefined
+}
 
+async function setupWorkletBridge(ctx: AudioContext): Promise<boolean> {
   const blob = new Blob([WORKLET_PROCESSOR_SRC], { type: 'application/javascript' })
   const blobURL = URL.createObjectURL(blob)
+  audioBackendState.workletBridgeStatus = 'pending'
 
-  ctx.audioWorklet.addModule(blobURL).then(() => {
-    URL.revokeObjectURL(blobURL)
+  try {
+    await ctx.audioWorklet.addModule(blobURL)
 
     const numCh = 2
     const ringShared = new SharedArrayBuffer(RING_FRAMES * numCh * 4)
@@ -449,22 +464,28 @@ function setupWorkletBridge(ctx: AudioContext): void {
     })
 
     audioBackendState.workletBridgeInstalled = true
-  }).catch((e: unknown) => {
+    audioBackendState.workletBridgeFailed = false
+    audioBackendState.workletBridgeStatus = 'installed'
+    return true
+  } catch (e: unknown) {
     audioBackendState.lastError = `addModule failed: ${e instanceof Error ? e.message : String(e)}`
-  })
+    audioBackendState.workletBridgeFailed = true
+    return false
+  } finally {
+    URL.revokeObjectURL(blobURL)
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Fake ScriptProcessorNode + drive loop
 // ---------------------------------------------------------------------------
 
-interface FakeNode {
-  onaudioprocess: ((e: { outputBuffer: AudioBuffer }) => void) | null
-  connect: (dest?: AudioNode) => void
-  disconnect: () => void
-}
-
-function fillRingToTarget(fakeBuffer: AudioBuffer, fake: FakeNode, bufferSize: number, numCh: number): void {
+function fillRingToTarget(
+  fakeBuffer: AudioBuffer,
+  fake: Pick<ScriptProcessorNode, 'onaudioprocess'>,
+  bufferSize: number,
+  numCh: number,
+): void {
   if (!audioBackendState.workletBridgeInstalled || !workletRingBuf || !workletWriteHead || !workletReadHead) return
 
   // Fill the ring up to TARGET, catching up after any main-thread stall.
@@ -485,7 +506,7 @@ function fillRingToTarget(fakeBuffer: AudioBuffer, fake: FakeNode, bufferSize: n
     const cb = fake.onaudioprocess
     if (!cb) break
 
-    cb({ outputBuffer: fakeBuffer })
+    cb.call(fake as ScriptProcessorNode, { outputBuffer: fakeBuffer } as AudioProcessingEvent)
     audioBackendState.sdlCallbackCount++
 
     // Copy planar AudioBuffer channels into interleaved ring buffer
@@ -500,24 +521,40 @@ function fillRingToTarget(fakeBuffer: AudioBuffer, fake: FakeNode, bufferSize: n
   }
 }
 
-function createFakeScriptProcessorNode(
+function createBridgeScriptProcessorNode(
   ctx: AudioContext,
-  bufferSize: number,
-  numCh: number,
+  args: Parameters<AudioContext['createScriptProcessor']>,
+  originalCreateScriptProcessor: AudioContext['createScriptProcessor'],
+  bridgeReady: Promise<boolean>,
 ): ScriptProcessorNode {
-  const fake: FakeNode = {
-    onaudioprocess: null,
-    connect: () => {},     // worklet node is already connected to destination
-    disconnect: () => {},
-  }
-
+  const bufferSize = args[0] ?? 1024
+  const numCh = args[2] ?? 2
   const fakeBuffer = ctx.createBuffer(numCh, bufferSize, ctx.sampleRate)
   const driveMs    = (bufferSize / ctx.sampleRate) * 1000
   audioBackendState.driveIntervalMs = driveMs
 
-  setInterval(() => fillRingToTarget(fakeBuffer, fake, bufferSize, numCh), driveMs)
-
-  return fake as unknown as ScriptProcessorNode
+  return createWorkletBackedScriptProcessorNode({
+    context: ctx,
+    args,
+    originalCreateScriptProcessor,
+    bridgeReady,
+    startWorkletDrive: node => {
+      const interval = window.setInterval(
+        () => fillRingToTarget(fakeBuffer, node, bufferSize, numCh),
+        driveMs,
+      )
+      return () => window.clearInterval(interval)
+    },
+    onFallback: reason => {
+      audioBackendState.workletBridgeFailed = true
+      audioBackendState.workletBridgeInstalled = false
+      audioBackendState.workletBridgeStatus = 'fallback'
+      audioBackendState.workletFallbacks++
+      if (reason != null) {
+        audioBackendState.lastError = reason instanceof Error ? reason.message : String(reason)
+      }
+    },
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -912,8 +949,16 @@ function instrumentAudioContext(context: AudioContext): AudioContext {
   lastAudioContext = context
   audioBackendState.contextsCreated++
 
+  let bridgeReady: Promise<boolean> | undefined
   if (audioBackendState.workletBridgeEnabled) {
-    setupWorkletBridge(context)
+    const unavailableReason = workletBridgeUnavailableReason(context)
+    if (unavailableReason) {
+      audioBackendState.lastError = unavailableReason
+      audioBackendState.workletBridgeFailed = true
+      audioBackendState.workletBridgeStatus = 'fallback'
+    } else {
+      bridgeReady = setupWorkletBridge(context)
+    }
   }
 
   try {
@@ -926,8 +971,17 @@ function instrumentAudioContext(context: AudioContext): AudioContext {
         numberOfOutputChannels: args[2],
       }
 
-      if (audioBackendState.workletBridgeEnabled) {
-        return createFakeScriptProcessorNode(context, args[0] ?? 1024, args[2] ?? 2)
+      if (
+        audioBackendState.workletBridgeEnabled
+        && !audioBackendState.workletBridgeFailed
+        && bridgeReady
+      ) {
+        return createBridgeScriptProcessorNode(
+          context,
+          args,
+          originalCreateScriptProcessor,
+          bridgeReady,
+        )
       }
 
       return originalCreateScriptProcessor.apply(this, args)
@@ -1071,6 +1125,7 @@ function installAudioContextHints() {
 
   audioBackendState.enabled = enabled
   audioBackendState.workletBridgeEnabled = workletBridgeEnabled
+  audioBackendState.workletBridgeStatus = workletBridgeEnabled ? 'pending' : 'disabled'
   audioBackendState.hiddenSuspendEnabled = hiddenSuspendEnabled
   audioBackendState.requestedSampleRate = requestedSampleRate
   audioBackendState.requestedLatencyHint = requestedLatencyHint
