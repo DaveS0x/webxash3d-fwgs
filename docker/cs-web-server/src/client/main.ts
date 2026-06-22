@@ -1,7 +1,10 @@
 import { loadAsync } from 'jszip'
 import xashURL from 'xash3d-fwgs/xash.wasm?url'
 import gl4esURL from 'xash3d-fwgs/libref_webgl2.wasm?url'
-import { createWorkletBackedScriptProcessorNode } from './audio-bridge'
+import {
+  calculateRingTargetFrames,
+  createWorkletBackedScriptProcessorNode,
+} from './audio-bridge'
 import { Xash3DWebRTC } from './webrtc'
 
 type AudioContextConstructor = {
@@ -51,8 +54,10 @@ type AudioBackendSnapshot = {
   sdlCallbackCount: number
   ringOverflowDrops: number
   workletUnderruns: number
+  workletDroppedFrames: number
   driveIntervalMs?: number
   ringFrames: number
+  ringTargetFrames?: number
   ringAvailable?: number
 }
 
@@ -257,7 +262,7 @@ declare global {
 
 const buildEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env ?? {}
 const RUNTIME_ASSET_VERSION = buildEnv.VITE_CS_RUNTIME_ASSET_VERSION ?? '20260427soundbuf1'
-const AUDIO_BACKEND_VARIANT = 'aw-bridge-20260622a'
+const AUDIO_BACKEND_VARIANT = 'aw-bridge-20260622b'
 const SPRAY_WAD_RUNTIME_PATHS = [
   '/rodir/cstrike/countersol_tempdecal.wad',
   '/rodir/cstrike/tempdecal.wad',
@@ -328,6 +333,7 @@ const audioBackendState: Omit<
   sdlCallbackCount: 0,
   ringOverflowDrops: 0,
   workletUnderruns: 0,
+  workletDroppedFrames: 0,
   ringFrames: 8192,
 }
 
@@ -359,15 +365,19 @@ const pointerLockGuardState: PointerLockGuardSnapshot = {
 // Ring buffer state (set up once the worklet module loads)
 // ---------------------------------------------------------------------------
 
-const RING_FRAMES = 16384
-// Keep ring 75% full (~557ms at 22050Hz). Larger target absorbs main-thread stalls that
-// previously drained the ring and caused worklet underruns (silence/reverb artefacts).
-// Trade-off: ~370ms more latency vs the 50% / 185ms baseline.
-const RING_TARGET = Math.floor(RING_FRAMES * 0.75) // 12288 frames ≈ 557ms at 22050Hz
+const RING_FRAMES = 8192
+const RING_TARGET_MS = 64
 
-let workletRingBuf: Float32Array | null = null
-let workletReadHead: Int32Array | null = null
-let workletWriteHead: Int32Array | null = null
+type WorkletBridgeState = {
+  ringBuf: Float32Array
+  readHead: Int32Array
+  writeHead: Int32Array
+  ringTargetFrames: number
+  underruns: number
+  droppedFrames: number
+}
+
+let activeWorkletBridgeState: WorkletBridgeState | null = null
 
 // ---------------------------------------------------------------------------
 // AudioWorklet processor — inlined to avoid a separate static file
@@ -380,12 +390,15 @@ class CSAudioProcessor extends AudioWorkletProcessor {
     super()
     this._ready = false
     this._underruns = 0
+    this._droppedFrames = 0
+    this._recovering = true
     this.port.onmessage = ({ data }) => {
       this._buf = new Float32Array(data.ring)
       this._rp  = new Int32Array(data.ctrl, 0, 1)
       this._wp  = new Int32Array(data.ctrl, 4, 1)
       this._rf  = data.ringFrames
       this._nc  = data.numCh
+      this._last = new Float32Array(this._nc)
       this._ready = true
     }
   }
@@ -399,13 +412,32 @@ class CSAudioProcessor extends AudioWorkletProcessor {
     const avail = (wp - rp + this._rf) % this._rf
     if (avail < n) {
       this._underruns++
-      if ((this._underruns & 63) === 1) this.port.postMessage(this._underruns)
+      this._droppedFrames += avail
+      Atomics.store(this._rp, 0, wp)
+      for (let c = 0; c < nc; c++) {
+        const start = this._last[c]
+        for (let i = 0; i < n; i++) out[c][i] = start * (1 - ((i + 1) / n))
+        this._last[c] = 0
+      }
+      this._recovering = true
+      if ((this._underruns & 31) === 1) {
+        this.port.postMessage({
+          underruns: this._underruns,
+          droppedFrames: this._droppedFrames,
+        })
+      }
       return true
     }
     for (let i = 0; i < n; i++) {
       const pos = ((rp + i) % this._rf) * this._nc
-      for (let c = 0; c < nc; c++) out[c][i] = this._buf[pos + c]
+      const recoveryGain = this._recovering && i < 64 ? (i + 1) / 64 : 1
+      for (let c = 0; c < nc; c++) {
+        const sample = this._buf[pos + c] * recoveryGain
+        out[c][i] = sample
+        this._last[c] = sample
+      }
     }
+    this._recovering = false
     Atomics.store(this._rp, 0, (rp + n) % this._rf)
     return true
   }
@@ -429,51 +461,67 @@ function workletBridgeUnavailableReason(ctx: AudioContext): string | undefined {
   return undefined
 }
 
-async function setupWorkletBridge(ctx: AudioContext): Promise<boolean> {
+async function prepareWorkletBridge(ctx: AudioContext): Promise<boolean> {
   const blob = new Blob([WORKLET_PROCESSOR_SRC], { type: 'application/javascript' })
   const blobURL = URL.createObjectURL(blob)
   audioBackendState.workletBridgeStatus = 'pending'
 
   try {
     await ctx.audioWorklet.addModule(blobURL)
-
-    const numCh = 2
-    const ringShared = new SharedArrayBuffer(RING_FRAMES * numCh * 4)
-    const ctrlShared = new SharedArrayBuffer(8) // [readHead: Int32, writeHead: Int32]
-
-    workletRingBuf  = new Float32Array(ringShared)
-    workletReadHead  = new Int32Array(ctrlShared, 0, 1)
-    workletWriteHead = new Int32Array(ctrlShared, 4, 1)
-
-    const node = new AudioWorkletNode(ctx, 'cs-audio', {
-      numberOfOutputs: 1,
-      outputChannelCount: [numCh],
-    })
-
-    node.port.onmessage = (e: MessageEvent<number>) => {
-      audioBackendState.workletUnderruns = e.data
-    }
-
-    node.connect(ctx.destination)
-
-    node.port.postMessage({
-      ring: ringShared,
-      ctrl: ctrlShared,
-      ringFrames: RING_FRAMES,
-      numCh,
-    })
-
-    audioBackendState.workletBridgeInstalled = true
-    audioBackendState.workletBridgeFailed = false
-    audioBackendState.workletBridgeStatus = 'installed'
     return true
   } catch (e: unknown) {
     audioBackendState.lastError = `addModule failed: ${e instanceof Error ? e.message : String(e)}`
     audioBackendState.workletBridgeFailed = true
+    audioBackendState.workletBridgeStatus = 'fallback'
     return false
   } finally {
     URL.revokeObjectURL(blobURL)
   }
+}
+
+function createWorkletBridge(
+  ctx: AudioContext,
+  bufferSize: number,
+  numCh: number,
+): WorkletBridgeState {
+  const ringShared = new SharedArrayBuffer(RING_FRAMES * numCh * 4)
+  const ctrlShared = new SharedArrayBuffer(8) // [readHead: Int32, writeHead: Int32]
+  const state: WorkletBridgeState = {
+    ringBuf: new Float32Array(ringShared),
+    readHead: new Int32Array(ctrlShared, 0, 1),
+    writeHead: new Int32Array(ctrlShared, 4, 1),
+    ringTargetFrames: calculateRingTargetFrames(
+      ctx.sampleRate,
+      bufferSize,
+      RING_FRAMES,
+      RING_TARGET_MS,
+    ),
+    underruns: 0,
+    droppedFrames: 0,
+  }
+
+  const node = new AudioWorkletNode(ctx, 'cs-audio', {
+    numberOfOutputs: 1,
+    outputChannelCount: [numCh],
+  })
+
+  node.port.onmessage = (event: MessageEvent<{ underruns: number; droppedFrames: number }>) => {
+    state.underruns = event.data.underruns
+    state.droppedFrames = event.data.droppedFrames
+  }
+
+  node.connect(ctx.destination)
+  node.port.postMessage({
+    ring: ringShared,
+    ctrl: ctrlShared,
+    ringFrames: RING_FRAMES,
+    numCh,
+  })
+
+  audioBackendState.workletBridgeInstalled = true
+  audioBackendState.workletBridgeFailed = false
+  audioBackendState.workletBridgeStatus = 'installed'
+  return state
 }
 
 // ---------------------------------------------------------------------------
@@ -481,21 +529,22 @@ async function setupWorkletBridge(ctx: AudioContext): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 function fillRingToTarget(
+  state: WorkletBridgeState,
   fakeBuffer: AudioBuffer,
   fake: Pick<ScriptProcessorNode, 'onaudioprocess'>,
   bufferSize: number,
   numCh: number,
 ): void {
-  if (!audioBackendState.workletBridgeInstalled || !workletRingBuf || !workletWriteHead || !workletReadHead) return
+  if (!audioBackendState.workletBridgeInstalled) return
 
   // Fill the ring up to TARGET, catching up after any main-thread stall.
-  // Cap at 8 batches per tick (~370ms of audio) to avoid blocking the thread.
+  // Cap at 8 batches per tick to avoid blocking the thread.
   for (let batch = 0; batch < 8; batch++) {
-    const rp   = Atomics.load(workletReadHead, 0)
-    const wp   = Atomics.load(workletWriteHead, 0)
+    const rp   = Atomics.load(state.readHead, 0)
+    const wp   = Atomics.load(state.writeHead, 0)
     const fill = (wp - rp + RING_FRAMES) % RING_FRAMES
 
-    if (fill >= RING_TARGET) break
+    if (fill >= state.ringTargetFrames) break
 
     const space = (rp - wp - 1 + RING_FRAMES) % RING_FRAMES
     if (space < bufferSize) {
@@ -514,10 +563,10 @@ function fillRingToTarget(
     for (let i = 0; i < bufferSize; i++) {
       const pos = ((wp + i) % RING_FRAMES) * numCh
       for (let c = 0; c < numCh; c++) {
-        workletRingBuf[pos + c] = fakeBuffer.getChannelData(c)[i]
+        state.ringBuf[pos + c] = fakeBuffer.getChannelData(c)[i]
       }
     }
-    Atomics.store(workletWriteHead, 0, newWp)
+    Atomics.store(state.writeHead, 0, newWp)
   }
 }
 
@@ -525,13 +574,22 @@ function createBridgeScriptProcessorNode(
   ctx: AudioContext,
   args: Parameters<AudioContext['createScriptProcessor']>,
   originalCreateScriptProcessor: AudioContext['createScriptProcessor'],
-  bridgeReady: Promise<boolean>,
+  workletModuleReady: Promise<boolean>,
 ): ScriptProcessorNode {
   const bufferSize = args[0] ?? 1024
   const numCh = args[2] ?? 2
   const fakeBuffer = ctx.createBuffer(numCh, bufferSize, ctx.sampleRate)
   const driveMs    = (bufferSize / ctx.sampleRate) * 1000
-  audioBackendState.driveIntervalMs = driveMs
+  const pollMs = Math.max(4, driveMs / 2)
+  let bridgeState: WorkletBridgeState | undefined
+  const bridgeReady = workletModuleReady.then(ready => {
+    if (!ready) return false
+    bridgeState = createWorkletBridge(ctx, bufferSize, numCh)
+    activeWorkletBridgeState = bridgeState
+    return true
+  })
+
+  audioBackendState.driveIntervalMs = pollMs
 
   return createWorkletBackedScriptProcessorNode({
     context: ctx,
@@ -540,8 +598,10 @@ function createBridgeScriptProcessorNode(
     bridgeReady,
     startWorkletDrive: node => {
       const interval = window.setInterval(
-        () => fillRingToTarget(fakeBuffer, node, bufferSize, numCh),
-        driveMs,
+        () => {
+          if (bridgeState) fillRingToTarget(bridgeState, fakeBuffer, node, bufferSize, numCh)
+        },
+        pollMs,
       )
       return () => window.clearInterval(interval)
     },
@@ -564,11 +624,12 @@ function createBridgeScriptProcessorNode(
 function audioContextSnapshot(): AudioBackendSnapshot {
   const context = window.SDL2?.audioContext ?? lastAudioContext
   const latencyCtx = context as (AudioContext & { outputLatency?: number }) | undefined
+  const bridgeState = activeWorkletBridgeState
 
   let ringAvailable: number | undefined
-  if (workletReadHead && workletWriteHead) {
-    const rp = Atomics.load(workletReadHead, 0)
-    const wp = Atomics.load(workletWriteHead, 0)
+  if (bridgeState) {
+    const rp = Atomics.load(bridgeState.readHead, 0)
+    const wp = Atomics.load(bridgeState.writeHead, 0)
     ringAvailable = (wp - rp + RING_FRAMES) % RING_FRAMES
   }
 
@@ -579,7 +640,10 @@ function audioContextSnapshot(): AudioBackendSnapshot {
     baseLatency: latencyCtx?.baseLatency,
     outputLatency: latencyCtx?.outputLatency,
     state: context?.state,
+    workletUnderruns: bridgeState?.underruns ?? audioBackendState.workletUnderruns,
+    workletDroppedFrames: bridgeState?.droppedFrames ?? audioBackendState.workletDroppedFrames,
     ringFrames: RING_FRAMES,
+    ringTargetFrames: bridgeState?.ringTargetFrames,
     ringAvailable,
   }
 }
@@ -949,7 +1013,7 @@ function instrumentAudioContext(context: AudioContext): AudioContext {
   lastAudioContext = context
   audioBackendState.contextsCreated++
 
-  let bridgeReady: Promise<boolean> | undefined
+  let workletModuleReady: Promise<boolean> | undefined
   if (audioBackendState.workletBridgeEnabled) {
     const unavailableReason = workletBridgeUnavailableReason(context)
     if (unavailableReason) {
@@ -957,7 +1021,7 @@ function instrumentAudioContext(context: AudioContext): AudioContext {
       audioBackendState.workletBridgeFailed = true
       audioBackendState.workletBridgeStatus = 'fallback'
     } else {
-      bridgeReady = setupWorkletBridge(context)
+      workletModuleReady = prepareWorkletBridge(context)
     }
   }
 
@@ -974,13 +1038,13 @@ function instrumentAudioContext(context: AudioContext): AudioContext {
       if (
         audioBackendState.workletBridgeEnabled
         && !audioBackendState.workletBridgeFailed
-        && bridgeReady
+        && workletModuleReady
       ) {
         return createBridgeScriptProcessorNode(
           context,
           args,
           originalCreateScriptProcessor,
-          bridgeReady,
+          workletModuleReady,
         )
       }
 

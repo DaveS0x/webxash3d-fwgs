@@ -7,6 +7,17 @@ export type WorkletBackedScriptProcessorOptions = {
   onFallback: (reason?: unknown) => void
 }
 
+export function calculateRingTargetFrames(
+  sampleRate: number,
+  bufferSize: number,
+  ringFrames: number,
+  targetMs: number,
+): number {
+  const desiredFrames = Math.ceil((sampleRate * targetMs) / 1000)
+  const wholeBuffers = Math.max(2, Math.ceil(desiredFrames / bufferSize))
+  return Math.min(wholeBuffers * bufferSize, ringFrames - bufferSize)
+}
+
 export function createWorkletBackedScriptProcessorNode(
   options: WorkletBackedScriptProcessorOptions,
 ): ScriptProcessorNode {

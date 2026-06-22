@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { createWorkletBackedScriptProcessorNode } from './audio-bridge'
+import {
+  calculateRingTargetFrames,
+  createWorkletBackedScriptProcessorNode,
+} from './audio-bridge'
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -28,6 +31,12 @@ function fakeNativeNode() {
   } as unknown as ScriptProcessorNode
   return { node, connections }
 }
+
+test('uses a low-latency whole-buffer ring target', () => {
+  assert.equal(calculateRingTargetFrames(48_000, 1024, 8192, 64), 3072)
+  assert.equal(calculateRingTargetFrames(22_050, 1024, 8192, 64), 2048)
+  assert.equal(calculateRingTargetFrames(192_000, 4096, 8192, 64), 4096)
+})
 
 test('keeps the worklet-backed proxy when setup succeeds', async () => {
   const ready = deferred<boolean>()
